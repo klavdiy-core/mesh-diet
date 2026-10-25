@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 
 
 @dataclass
@@ -345,7 +345,9 @@ def _drop_flaps(m):
     _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
     inv = np.asarray(inv).ravel()
     bad = cnt[inv] > 1
-    if bad.any() and not bad.all():
+    # all flaps = nothing real is left: drop them all and let the caller say so (regrade 12: 100 boxes became 99 flat
+    # pairs reported as «watertight True», because an all-flap mesh was kept)
+    if bad.any():
         m.update_faces(~bad)
         m.remove_unreferenced_vertices()
 
@@ -364,23 +366,35 @@ def measured_parts(m, parts, touch=0.02, big=0.25):
     of the largest's faces (two equal halves both count)."""
     if len(parts) <= 1:
         return list(parts)
-    main = max(range(len(parts)), key=lambda i: len(parts[i]))
-    boxes = [m.submesh([p], append=True).bounds for p in parts]
-    eps = touch * float(np.max(boxes[main][1] - boxes[main][0]))
+    P = len(parts)
+    main = max(range(P), key=lambda i: len(parts[i]))
+    # every part's box in one pass, and the group grown in waves against all the rest at once: a loop of submeshes
+    # and a Python any() over the group never finished a tree of 30,000 leaf cards (regrade 12)
+    lens = np.array([len(p) for p in parts])
+    offs = np.concatenate([[0], np.cumsum(lens)])
+    tri = m.triangles[np.concatenate(parts)]
+    lo = np.minimum.reduceat(tri.min(axis=1), offs[:-1])
+    hi = np.maximum.reduceat(tri.max(axis=1), offs[:-1])
+    eps = touch * float(np.max(hi[main] - lo[main]))
     # «a quarter of its size» is its size: the longest side of its box, not its face count — a 12-face 3 m pole next
     # to a 5000-face ball is the bigger thing (regrade 3: the README said size, the code counted faces)
-    reach = [float(np.max(b[1] - b[0])) for b in boxes]
-    keep = {main} | {i for i in range(len(parts)) if reach[i] >= big * reach[main]}
-    grew = True
-    while grew:
-        grew = False
-        for i, b in enumerate(boxes):
-            if i in keep:
-                continue
-            if any(np.all(b[0] <= boxes[j][1] + eps) and np.all(boxes[j][0] - eps <= b[1]) for j in keep):
-                keep.add(i)
-                grew = True
-    return [parts[i] for i in sorted(keep)]
+    reach = (hi - lo).max(axis=1)
+    keep = reach >= big * reach[main]
+    keep[main] = True
+    wave = np.flatnonzero(keep)
+    while len(wave):
+        rest = np.flatnonzero(~keep)
+        if not len(rest):
+            break
+        joined = np.zeros(len(rest), dtype=bool)
+        for s in range(0, len(wave), 256):
+            w = wave[s:s + 256]
+            ov = (lo[rest][:, None, :] <= hi[w][None, :, :] + eps).all(axis=2) & \
+                 (lo[w][None, :, :] - eps <= hi[rest][:, None, :]).all(axis=2)
+            joined |= ov.any(axis=1)
+        wave = rest[joined]
+        keep[wave] = True
+    return [parts[i] for i in np.flatnonzero(keep)]
 
 
 # ---------- the whole diet ----------
@@ -440,7 +454,9 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
             targets.pop()
             break
         budget *= lod_ratio
-    decimated = len(chain[0].faces) < len(m.faces)
+    # any LOD, not LOD0 alone: LOD0 within budget kept its texture while LOD1 went grey, «texture_lost: false» (regrade 12)
+    decimated = any(len(c.faces) < len(m.faces) for c in chain)
+    only_lower = decimated and len(chain[0].faces) >= len(m.faces)
     # nothing decimated = nothing lost (regrade 3: a false warning) — unless merging the scene already lost it
     texture_lost = had_texture and (decimated or lost_on_load)
     colours_lost = had_colours and (decimated or lost_on_load)
@@ -473,11 +489,16 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
                    "the simplifier would not collapse further here; usual causes: coarse closed shapes, flat grids "
                    "with open borders, fans of many triangles around one vertex")
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}: {why}.")
-    parts_after = len(loose_parts(chain[0]))
-    parts_lost = max(0, len(loose_parts(m)) - parts_after)
+    parts_before, parts_after = len(loose_parts(m)), len(loose_parts(chain[0]))
+    parts_lost = max(0, parts_before - parts_after)
+    if parts_after > parts_before:
+        # cleaning runs before decimation; the simplifier can tear off new slivers (regrade 12: 14 new 1-11-face floaters)
+        warnings.append(f"decimation tore off {parts_after - parts_before} new loose piece(s) in LOD0; raise --faces, or "
+                        "drop them in your DCC tool.")
     for i, (x, t) in enumerate(zip(chain, targets)):
         # «within ~3% of the target» held for one body; 2000 crates collapsed to 2000 faces for a 5000 budget (regrade 11)
-        if t < len(m.faces) and len(x.faces) < 0.9 * t:
+        # not on tiny budgets: «LOD12 came out at 4 faces, 20% under 5» meant nothing (regrade 12)
+        if t < len(m.faces) and t >= 50 and len(x.faces) < 0.9 * t:
             warnings.append(f"LOD{i} came out at {len(x.faces)} faces, {100 - 100 * len(x.faces) // t}% under the "
                             f"budget {t}: the simplifier collapsed whole small parts instead of thinning them. "
                             "Raise --faces, or simplify the parts separately.")
@@ -497,13 +518,13 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         warnings.append(f"the file has {src['materials']} different looks (materials / colours) on separate parts; "
                         "merging them into one mesh keeps one. Split the parts and run each, or reassign materials "
                         "in your DCC tool.")
+    which = "LOD1 and lower are" if only_lower and not lost_on_load else "the output is"
     if texture_lost:
-        warnings.append("the input has a texture / UVs; the output is geometry only (the simplifier does not carry "
-                        "UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original "
-                        "for close-ups.")
+        warnings.append(f"the input has a texture / UVs; {which} geometry only (the simplifier does not carry UVs). "
+                        "Re-unwrap and bake the texture in your DCC tool, or keep the original for close-ups.")
     if colours_lost:
-        warnings.append("the input has vertex colours; the output is geometry only (the simplifier drops them). "
-                        "Re-project the colours onto LOD0 in your DCC tool, or keep the original for close-ups.")
+        warnings.append(f"the input has vertex colours; {which} geometry only (the simplifier drops them). "
+                        "Re-project the colours in your DCC tool, or keep the original for close-ups.")
     if removed:
         warnings.append(f"{removed} small loose part(s) removed, {removed_share:g}% of the faces (--min-component); "
                         "set --min-component 0 to keep every part.")
@@ -586,8 +607,9 @@ def main(argv=None):
     a.min_component_given = any(x == "--min-component" or x.startswith("--min-component=") for x in argv)
     for flag, ok, need in (("--faces", a.faces >= 1, "at least 1"), ("--lods", a.lods >= 1, "at least 1"),
                            ("--lod-ratio", 0 < a.lod_ratio < 1, "between 0 and 1"),
-                           ("--height", a.height is None or a.height > 0, "above 0"),
-                           ("--size", a.size is None or a.size > 0, "above 0"),
+                           # finite too: inf passed «> 0» and ended in NumPy noise (regrade 12)
+                           ("--height", a.height is None or 0 < a.height < float("inf"), "a finite number above 0"),
+                           ("--size", a.size is None or 0 < a.size < float("inf"), "a finite number above 0"),
                            ("--min-component", 0 <= a.min_component < 1, "from 0 to below 1")):
         if not ok:
             print(f"mesh-diet: {flag} must be {need}", file=sys.stderr)
@@ -630,8 +652,12 @@ def main(argv=None):
                     if os.path.exists(d):
                         raise NotADirectoryError(0, f"{d} is a file, not a folder")
                     d = os.path.dirname(d)
-                with tempfile.TemporaryFile(dir=d):
+                # one exclusive-create probe, removed at once. tempfile.TemporaryFile retries a PermissionError on
+                # Windows while os.access says writable — «C:/Program Files/x.glb» hung forever (regrade 12)
+                probe = os.path.join(d, f".mesh-diet-probe-{os.getpid()}")
+                with open(probe, "xb"):
                     pass
+                os.remove(probe)
         except OSError as e:
             print(f"mesh-diet: cannot write {p}: {e.strerror}", file=sys.stderr)
             return 2

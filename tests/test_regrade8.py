@@ -61,7 +61,7 @@ class Regrade9(unittest.TestCase):
             b = trimesh.creation.box(extents=[0.5] * 3)
             b.apply_translation([(k % 23) * 0.6, 0, (k // 23) * 0.6])
             boxes.append(b)
-        res = md.diet(trimesh.util.concatenate(boxes), faces=1000)
+        res = md.diet(trimesh.util.concatenate(boxes), faces=2500)   # 1000 = 2 faces a box: all flat flaps, a plain error since 0.5.9
         lost = res.report["parts_lost_in_decimation"]
         self.assertEqual(lost, 500 - res.report["after"]["components"])
         if lost:
