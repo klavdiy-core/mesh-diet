@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 
 @dataclass
@@ -203,6 +203,31 @@ def decimate(m, faces, tolerance=0.03, tries=6):
     return out
 
 
+MIN_LOD_FACES = 4
+
+
+def measured_parts(m, parts, touch=0.02, big=0.25):
+    """The face lists of the parts that make up the model for measuring: the largest, every part whose box touches
+    the group's (within `touch` of the main body's size, repeated until nothing joins), and any part at least `big`
+    of the largest's faces (two equal halves both count)."""
+    if len(parts) <= 1:
+        return list(parts)
+    main = max(range(len(parts)), key=lambda i: len(parts[i]))
+    boxes = [m.submesh([p], append=True).bounds for p in parts]
+    eps = touch * float(np.max(boxes[main][1] - boxes[main][0]))
+    keep = {main} | {i for i, p in enumerate(parts) if len(p) >= big * len(parts[main])}
+    grew = True
+    while grew:
+        grew = False
+        for i, b in enumerate(boxes):
+            if i in keep:
+                continue
+            if any(np.all(b[0] <= boxes[j][1] + eps) and np.all(boxes[j][0] - eps <= b[1]) for j in keep):
+                keep.add(i)
+                grew = True
+    return [parts[i] for i in sorted(keep)]
+
+
 # ---------- the whole diet ----------
 
 def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y",
@@ -214,18 +239,28 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     orient(m, up)
     chain, targets = [], []
     budget = faces
+    warnings = []
     for i in range(max(1, lods)):
-        targets.append(int(round(budget)))
-        chain.append(decimate(chain[-1] if chain else m, targets[-1]))
+        t = int(round(budget))
+        if i and (t < MIN_LOD_FACES or len(chain[-1].faces) <= MIN_LOD_FACES):
+            # a LOD of 0-2 faces is an empty file (regrade 2: LOD7-9 were written with nothing in them)
+            warnings.append(f"LODs stopped at LOD{i - 1}: the next would have under {MIN_LOD_FACES} faces "
+                            f"(asked for {lods}). Raise --faces or lower --lods.")
+            break
+        targets.append(t)
+        chain.append(decimate(chain[-1] if chain else m, t))
         budget *= lod_ratio
-    # measure the size on LOD0, so the mesh people use is exactly as tall as asked - on its main body: a kept loose
-    # part 2 m above the head used to shrink a 1.8 m figure to 0.82 m without a word (25.10 regrade)
+    # measure the size on LOD0, so the mesh people use is exactly as tall as asked. Not on every loose part: a stray
+    # shard 2 m above the head shrank a 1.8 m figure to 0.82 m (regrade 1). Not on the main body alone either: a
+    # table whose legs are separate pieces came out 11.25 m tall with its legs under the floor (regrade 2). So: the
+    # main body and every part that touches it (or touches a part that does), and any part a quarter its size.
     parts = loose_parts(chain[0])
-    body = chain[0] if len(parts) <= 1 else chain[0].submesh([max(parts, key=len)], append=True)
+    group = measured_parts(chain[0], parts)
+    body = chain[0] if len(group) == len(parts) else chain[0].submesh(group, append=True)
     if height and body.extents[1] <= 0:
         raise ValueError(f"the mesh has no height along the up axis ({up}); use --size, or set --up")
     mat = placement(body, height=height, size=size, pivot=pivot)
-    if len(parts) > 1:
+    if len(group) < len(parts):
         lo, hi = body.bounds
         out_lo, out_hi = chain[0].bounds
         reach = float(np.max(np.concatenate([lo - out_lo, out_hi - hi])) / max(body.extents.max(), 1e-12))
@@ -234,7 +269,6 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     for x in [m] + chain:
         x.apply_transform(mat)
     err = shape_error(m, chain[0])
-    warnings = []
     for i, (x, t) in enumerate(zip(chain, targets)):
         if len(x.faces) > 1.05 * t and len(x.faces) < len(m.faces):
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}. "
@@ -243,10 +277,10 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         warnings.append("the input has a texture / UVs; the output is geometry only (the simplifier does not carry "
                         "UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original "
                         "for close-ups.")
-    if len(parts) > 1:
-        warnings.append(f"{len(parts)} parts left; the size was measured on the main body"
-                        + (f", and the others reach {reach * 100:.0f}% of its size beyond it" if reach > 0.05 else "")
-                        + ". Raise --min-component (e.g. 0.05) to drop small loose parts.")
+    if len(group) < len(parts):
+        warnings.append(f"{len(parts) - len(group)} of {len(parts)} parts float apart from the model and were left out "
+                        "of the size" + (f"; they reach {reach * 100:.0f}% of its size beyond it" if reach > 0.05 else "")
+                        + ". If they are stray bits, raise --min-component to drop them.")
     if err["max_percent_of_size"] > 2.0:
         warnings.append(f"shape moved by up to {err['max_percent_of_size']}% of the size; check it by eye "
                         "or raise --faces.")
@@ -287,7 +321,7 @@ def main(argv=None):
                     help="where the origin goes (default bottom: centred, standing on y=0)")
     ap.add_argument("--min-component", type=float, default=0.002,
                     help="drop loose parts with fewer than this share of all faces (default 0.002)")
-    ap.add_argument("--report", help="write the JSON report here (it is also printed)")
+    ap.add_argument("--report", help="write the full JSON report here (the console shows a summary)")
     ap.add_argument("--version", action="version", version=__version__)
     a = ap.parse_args(argv)
     for flag, ok, need in (("--faces", a.faces >= 1, "at least 1"), ("--lods", a.lods >= 1, "at least 1"),
@@ -315,6 +349,13 @@ def main(argv=None):
         print(f"mesh-diet: {e}", file=sys.stderr)
         return 2
     out = a.output or os.path.splitext(a.input)[0] + ".diet.glb"
+    for p in (out, a.report):                    # a missing folder used to crash after the LODs were written
+        if p and os.path.dirname(os.path.abspath(p)):
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+            except OSError as e:
+                print(f"mesh-diet: cannot make the folder for {p}: {e.strerror}", file=sys.stderr)
+                return 2
     for i, m in enumerate(res.lods):
         p = _lod_path(out, i)
         m.export(p)
