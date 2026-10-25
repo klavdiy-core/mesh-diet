@@ -36,6 +36,7 @@ python mesh_diet.py refined.glb                                   # 20k faces, p
 python mesh_diet.py refined.glb -o chair.glb --faces 8000 --height 0.9
 python mesh_diet.py refined.glb -o hero.glb --faces 30000 --lods 4 --height 1.8 --report hero.json
 python mesh_diet.py scan.obj -o rock.glb --up z --size 2.5 --pivot center
+python mesh_diet.py upside.obj --up -z                            # -z / -y work with a space too (0.5.3)
 ```
 
 LODs land next to the output: `hero.glb` (LOD0), `hero_LOD1.glb`, `hero_LOD2.glb`… The `_LODn` suffix is the naming Unity and Unreal recognise on import.
@@ -73,25 +74,29 @@ print(res.report["shape_error"], res.report["warnings"])
 - One mesh per file: a multi-object scene is merged into one mesh.
 - `--height` and `--size` are measured on the model (0.4.0): the largest part, every part that touches it or touches
   a part that does (a table with separate legs is measured whole), and any part at least a quarter of its size. Only
-  a part floating apart from all of them is left out, and a warning says how far it reaches. 0.3.0 measured the
+  a part floating apart from all of them is left out, and a warning says how far it reaches — then the output is
+  taller or wider than asked (a tree whose leaves float around the top: asked 4 m, 5.48 m overall). Scale such a
+  model by hand or with `--size`. 0.3.0 measured the
   largest part alone, and a 0.75 m table with separate legs came out 11.25 m tall with the legs under the floor;
   before 0.3.0 a stray shard above the head shrank the figure. A part is loose when it shares no vertex with the
   rest: slivers the simplifier leaves on a sharp edge are not counted.
 - LODs stop when the next one would have under 4 faces (a warning says so); 0.3.0 wrote empty LOD files.
 - Loose parts below `--min-component` are deleted, and the report says how many and what share of the faces they were.
-  Only crumbs, though: if they add up to more than half the model (1000 equal cubes are each 0.1% of the faces), none
-  is deleted (0.5.0; 0.4.0 deleted 999 of them and reported 0% shape cost). For a hand-made model with many small
-  bolts set `--min-component 0`.
+  Only crumbs, though: if they add up to 5% of the faces or more, they are the model and none is deleted (0.5.3:
+  0.5.2 allowed up to half and deleted a tree's 1000 leaf cards, 44% of it, by default; 0.4.0 deleted 999 of 1000
+  equal cubes). For a hand-made model with many small bolts set `--min-component 0`.
 - "A quarter of its size" means the longest side of its box (0.5.0), not its face count: a 12-face pole 3 m tall
   next to a 5000-face ball is part of the model.
 - Vertex colours (what most image-to-3D tools output) are not carried either: `colours_lost: true` and a warning.
   Neither warning appears when nothing was decimated.
-- Output formats: .glb .gltf .obj .ply .stl .off, checked before any work; a .gltf is written self-contained (buffers embedded), so LODs never share buffer files. A mesh within its budget is written from the original vertices, UV seams intact. A budget that leaves no triangles, or an
+- Output formats: .glb .gltf .obj .ply .stl .off, checked before any work; a .gltf is written self-contained (buffers embedded), so LODs never share buffer files; an .obj gets its own `<name>.mtl` and `<name>_*.png` (0.5.3: every OBJ used to
+  write `material.mtl`, and a second asset in the folder took the first one's texture). A mesh within its budget is written from the original vertices, UV seams intact. A budget that leaves no triangles, or an
   input of only zero-area triangles, is a plain error.
 - The shape error is also measured per loose part, against that part's own size (`worst_part_percent`), and a part
   that moved more than 10% of itself is named (0.5.2): 400 crates each crushed to a bipyramid moved 69% of a crate but
-  1.25% of the scene, and 0.5.1 said nothing. Small parts get at least 32 sample points each; past 4096 parts only
-  the whole is measured.
+  1.25% of the scene, and 0.5.1 said nothing. Every part gets 32 sample points of its own. Past 100,000 parts only
+  the whole is measured, and the report says so (`worst_part_percent: null` and a warning); 0.5.2 stopped at 4096
+  and reported 0.0.
 - A scene file with several materials is merged into one mesh, and merging drops the materials: that is reported as
   `texture_lost` / `colours_lost` even when nothing was decimated (0.5.2; 0.5.1 said false).
 - Loose parts are counted one way everywhere (shares no vertex with the rest); 0.5.1 removed by edge-connectivity and

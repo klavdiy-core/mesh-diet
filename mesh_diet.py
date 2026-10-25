@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 
 @dataclass
@@ -147,26 +147,38 @@ def shape_error(a, b, n=20000):
     # the same error as a share of each loose part's own size: 400 crates each crushed to a bipyramid moved 69% of a
     # crate but 1.25% of the scene, and nothing warned (regrade 5). Small parts get extra samples of their own.
     parts = loose_parts(a)
-    if 1 < len(parts) <= MAX_PART_CHECK:
+    if len(parts) > MAX_PART_CHECK:
+        out["worst_part_percent"] = None                 # not measured — said, never a silent 0.0 (regrade 6)
+        out["parts_not_measured"] = len(parts)
+    elif len(parts) > 1:
+        # all parts at once (a loop of submeshes took 85 s for 1000 leaves and was capped at 4096 parts, regrade 6):
+        # faces laid out part by part, 32 area-weighted points per part on top of the shared samples
+        P = len(parts)
+        lens = np.array([len(p) for p in parts])
+        order = np.concatenate(parts)
+        offs = np.concatenate([[0], np.cumsum(lens)])
         label = np.empty(len(a.faces), dtype=int)
-        for i, p in enumerate(parts):
-            label[p] = i
-        per = np.bincount(label[fa], minlength=len(parts))
-        worst, worst_faces = 0.0, 0
-        for i, p in enumerate(parts):
-            sub = a.submesh([p], append=True)
-            diag = float(np.linalg.norm(sub.extents))
-            if diag <= 0:
-                continue
-            dd = da[label[fa] == i]
-            if per[i] < 32:
-                extra, _ = trimesh.sample.sample_surface(sub, 32 - per[i], seed=3 + i)
-                dd = np.concatenate([dd, _to_surface(extra, b)])
-            share = 100 * float(dd.max()) / diag
-            if share > worst:
-                worst, worst_faces = share, len(p)
-        out["worst_part_percent"] = round(worst, 3)
-        out["worst_part_faces"] = int(worst_faces)
+        label[order] = np.repeat(np.arange(P), lens)
+        tri = a.triangles[order]
+        lo = np.minimum.reduceat(tri.min(axis=1), offs[:-1])
+        hi = np.maximum.reduceat(tri.max(axis=1), offs[:-1])
+        diag = np.linalg.norm(hi - lo, axis=1)
+        csum = np.concatenate([[0.0], np.cumsum(a.area_faces[order])])
+        base, tot = csum[offs[:-1]], csum[offs[1:]] - csum[offs[:-1]]
+        rng = np.random.default_rng(3)
+        u = (base[:, None] + rng.random((P, 32)) * tot[:, None]).ravel()
+        k = np.searchsorted(csum, u, side="right") - 1
+        k = np.clip(k, np.repeat(offs[:-1], 32), np.repeat(offs[1:] - 1, 32))
+        r = rng.random((P * 32, 2))
+        r = np.where(r.sum(axis=1, keepdims=True) > 1, 1 - r, r)
+        t = tri[k]
+        extra = t[:, 0] + r[:, :1] * (t[:, 1] - t[:, 0]) + r[:, 1:] * (t[:, 2] - t[:, 0])
+        worst = _to_surface(extra, b).reshape(P, 32).max(axis=1)
+        np.maximum.at(worst, label[fa], da)
+        share = np.where(diag > 0, 100 * worst / np.where(diag > 0, diag, 1), 0.0)
+        i = int(np.argmax(share))
+        out["worst_part_percent"] = round(float(share[i]), 3)
+        out["worst_part_faces"] = int(lens[i])
     return out
 
 
@@ -193,8 +205,9 @@ def clean(m, min_component=0.002):
     keep = [p for p in parts if len(p) >= min_component * len(m.faces)]
     kept_faces = sum(len(p) for p in keep)
     # «small loose parts» are crumbs only while they are a small share of the model: 1000 equal cubes are each 0.1 %
-    # of the faces, and 999 of them were deleted with «shape cost 0 %» (regrade 3). Past half the model, keep all.
-    if kept_faces < 0.5 * len(m.faces):
+    # of the faces, and 999 of them were deleted with «shape cost 0 %» (regrade 3). Half was still too much: a tree's
+    # 1000 leaf cards, 44% of it, went by default (regrade 6). Past 5% of the faces, they are the model: keep all.
+    if kept_faces < (1 - CRUMB_MAX_SHARE) * len(m.faces):
         return m, 0, 0.0, good
     mask = np.zeros(len(m.faces), dtype=bool)
     mask[np.concatenate(keep)] = True
@@ -260,7 +273,8 @@ def decimate(m, faces, tolerance=0.03, tries=6):
 
 
 MIN_LOD_FACES = 4
-MAX_PART_CHECK = 4096       # loose parts measured one by one in the shape check; past this only the whole is measured
+MAX_PART_CHECK = 100_000    # loose parts measured one by one in the shape check; past this only the whole, and said
+CRUMB_MAX_SHARE = 0.05      # small loose parts are dropped as crumbs only while all of them are under 5% of the faces
 PART_WARN_PERCENT = 10.0    # a part that moved more than this share of its own size is named
 OUT_EXT = {".glb", ".gltf", ".obj", ".ply", ".stl", ".off"}
 
@@ -368,7 +382,10 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}. "
                             "Usually fans of very many triangles around one vertex (poles, cones, cylinder caps), "
                             "or a mesh already too coarse to lose more without falling apart.")
-    if err.get("worst_part_percent", 0) > PART_WARN_PERCENT:
+    if err.get("worst_part_percent") is None:
+        warnings.append(f"{err['parts_not_measured']} separate parts: too many to measure one by one, so damage to a "
+                        "single small part is not checked; look at the result by eye.")
+    elif err["worst_part_percent"] > PART_WARN_PERCENT:
         warnings.append(f"a separate part ({err['worst_part_faces']} faces) changed shape by up to "
                         f"{err['worst_part_percent']:g}% of its own size, though the whole moved less. Small parts "
                         "(eyes, bolts, crates) lose most; raise --faces or simplify them separately.")
@@ -385,7 +402,8 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     if len(group) < len(parts):
         warnings.append(f"{len(parts) - len(group)} of {len(parts)} parts float apart from the model and were left out "
                         "of the size" + (f"; they reach {reach * 100:.0f}% of its size beyond it" if reach > 0.05 else "")
-                        + ". If they are stray bits, raise --min-component to drop them.")
+                        + ", so the output is taller or wider than asked. If they are stray bits, raise "
+                        "--min-component to drop them; if they belong (leaves, a canopy), scale by hand or with --size.")
     if err["max_percent_of_size"] > 2.0:
         warnings.append(f"shape moved by up to {err['max_percent_of_size']}% of the size; check it by eye "
                         "or raise --faces.")
@@ -430,7 +448,11 @@ def main(argv=None):
                     help="drop loose parts with fewer than this share of all faces (default 0.002)")
     ap.add_argument("--report", help="write the full JSON report here (the console shows a summary)")
     ap.add_argument("--version", action="version", version=__version__)
-    a = ap.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for i in range(len(argv) - 1):                # «--up -z» read -z as an option (regrade 6); --up=-z always worked
+        if argv[i] == "--up" and argv[i + 1] in ("-y", "-z"):
+            argv[i:i + 2] = [f"--up={argv[i + 1]}", ""]
+    a = ap.parse_args([x for x in argv if x != ""])
     for flag, ok, need in (("--faces", a.faces >= 1, "at least 1"), ("--lods", a.lods >= 1, "at least 1"),
                            ("--lod-ratio", 0 < a.lod_ratio < 1, "between 0 and 1"),
                            ("--height", a.height is None or a.height > 0, "above 0"),
@@ -483,6 +505,21 @@ def main(argv=None):
             files = export_gltf(trimesh.Scene(m), embed_buffers=True)
             with open(p, "wb") as fh:
                 fh.write(files["model.gltf"])
+        elif p.lower().endswith(".obj"):
+            # trimesh names every material material.mtl / material_0.png: a second asset in the same folder
+            # replaced the first one's texture (regrade 6). Each OBJ gets its own <stem>.mtl and <stem>_*.png.
+            from trimesh.exchange.obj import export_obj
+            stem = os.path.splitext(os.path.basename(p))[0]
+            text, extra = export_obj(m, return_texture=True, mtl_name=f"{stem}.mtl")
+            ren = {k: f"{stem}_{k}" for k in extra if not k.endswith(".mtl")}
+            for k, v in extra.items():
+                if k.endswith(".mtl"):
+                    for old, new in ren.items():
+                        v = v.replace(old.encode(), new.encode())
+                with open(os.path.join(os.path.dirname(os.path.abspath(p)), ren.get(k, k)), "wb") as fh:
+                    fh.write(v)
+            with open(p, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
         else:
             m.export(p)
         res.report["lods"][i]["file"] = os.path.basename(p)
