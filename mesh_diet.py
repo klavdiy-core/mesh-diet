@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 
 @dataclass
@@ -133,15 +133,41 @@ def _to_surface(points, mesh, k=16):
 
 def shape_error(a, b, n=20000):
     """Symmetric sampled point-to-surface distance between a and b, in metres and in % of a's size."""
-    pa, _ = trimesh.sample.sample_surface(a, n, seed=1)
+    pa, fa = trimesh.sample.sample_surface(a, n, seed=1)
     pb, _ = trimesh.sample.sample_surface(b, n, seed=2)
-    d = np.concatenate([_to_surface(pa, b), _to_surface(pb, a)])
+    da = _to_surface(pa, b)
+    d = np.concatenate([da, _to_surface(pb, a)])
     size = float(np.linalg.norm(a.extents)) or 1.0
-    return {
+    out = {
         "max_m": round(float(d.max()), 6),
         "mean_m": round(float(d.mean()), 6),
         "max_percent_of_size": round(100 * float(d.max()) / size, 3),
+        "worst_part_percent": 0.0,
     }
+    # the same error as a share of each loose part's own size: 400 crates each crushed to a bipyramid moved 69% of a
+    # crate but 1.25% of the scene, and nothing warned (regrade 5). Small parts get extra samples of their own.
+    parts = loose_parts(a)
+    if 1 < len(parts) <= MAX_PART_CHECK:
+        label = np.empty(len(a.faces), dtype=int)
+        for i, p in enumerate(parts):
+            label[p] = i
+        per = np.bincount(label[fa], minlength=len(parts))
+        worst, worst_faces = 0.0, 0
+        for i, p in enumerate(parts):
+            sub = a.submesh([p], append=True)
+            diag = float(np.linalg.norm(sub.extents))
+            if diag <= 0:
+                continue
+            dd = da[label[fa] == i]
+            if per[i] < 32:
+                extra, _ = trimesh.sample.sample_surface(sub, 32 - per[i], seed=3 + i)
+                dd = np.concatenate([dd, _to_surface(extra, b)])
+            share = 100 * float(dd.max()) / diag
+            if share > worst:
+                worst, worst_faces = share, len(p)
+        out["worst_part_percent"] = round(worst, 3)
+        out["worst_part_faces"] = int(worst_faces)
+    return out
 
 
 # ---------- steps ----------
@@ -159,7 +185,9 @@ def clean(m, min_component=0.002):
     m.update_faces(good)
     m.remove_unreferenced_vertices()
     alive = np.flatnonzero(good)                       # m's face i is original face alive[i]
-    parts = components(m)
+    # the README's «loose part» (shares no vertex): edge-components split a body at a non-manifold edge, and a
+    # character's 5 parts were counted as 60, «56 removed, 3 left» (regrade 5)
+    parts = loose_parts(m)
     if len(parts) <= 1:
         return m, 0, 0.0, good
     keep = [p for p in parts if len(p) >= min_component * len(m.faces)]
@@ -232,6 +260,8 @@ def decimate(m, faces, tolerance=0.03, tries=6):
 
 
 MIN_LOD_FACES = 4
+MAX_PART_CHECK = 4096       # loose parts measured one by one in the shape check; past this only the whole is measured
+PART_WARN_PERCENT = 10.0    # a part that moved more than this share of its own size is named
 OUT_EXT = {".glb", ".gltf", ".obj", ".ply", ".stl", ".off"}
 
 
@@ -263,12 +293,18 @@ def measured_parts(m, parts, touch=0.02, big=0.25):
 # ---------- the whole diet ----------
 
 def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y",
-         pivot="bottom", min_component=0.002):
+         pivot="bottom", min_component=0.002, source_had=None):
+    """source_had: {"texture": bool, "colours": bool} of the FILE, when the caller merged a scene into `mesh` —
+    merging parts with different materials drops every visual before diet() could see one (regrade 5)."""
     before = stats(mesh)
     # the simplifier keeps geometry only: say so instead of dropping the texture without a word
-    had_texture = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
+    has_texture = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
     # vertex colours are what image-to-3D output carries; they went without a word (regrade 3)
-    had_colours = getattr(mesh.visual, "kind", None) == "vertex"
+    has_colours = getattr(mesh.visual, "kind", None) == "vertex"
+    src = source_had or {}
+    had_texture = has_texture or bool(src.get("texture"))
+    had_colours = has_colours or bool(src.get("colours"))
+    lost_on_load = (had_texture and not has_texture) or (had_colours and not has_colours)
     m, removed, removed_share, keep_orig = clean(mesh, min_component)
     if len(m.faces) == 0:
         raise ValueError("nothing is left after cleaning: every triangle was degenerate (zero area)")
@@ -292,7 +328,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
             chain.append(raw.copy())                  # within budget: nothing to simplify, nothing welded away
         else:
             chain.append(decimate(m if not chain or len(chain[-1].faces) >= len(m.faces) else chain[-1], t))
-        if i and len(chain[-1].faces) >= len(chain[-2].faces):
+        if i and len(chain[-1].faces) >= len(chain[-2].faces) and t >= len(chain[-2].faces):
             # a budget above the mesh made identical LOD files without a word (regrade 4)
             warnings.append(f"LOD{i} is no smaller than LOD{i - 1} ({len(chain[-1].faces)} faces): the budget is "
                             "above what this mesh has; lower --faces to get real LODs.")
@@ -304,8 +340,9 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
             break
         budget *= lod_ratio
     decimated = len(chain[0].faces) < len(m.faces)
-    texture_lost = had_texture and decimated      # nothing decimated = nothing lost (regrade 3: a false warning)
-    colours_lost = had_colours and decimated
+    # nothing decimated = nothing lost (regrade 3: a false warning) — unless merging the scene already lost it
+    texture_lost = had_texture and (decimated or lost_on_load)
+    colours_lost = had_colours and (decimated or lost_on_load)
     # measure the size on LOD0, so the mesh people use is exactly as tall as asked. Not on every loose part: a stray
     # shard 2 m above the head shrank a 1.8 m figure to 0.82 m (regrade 1). Not on the main body alone either: a
     # table whose legs are separate pieces came out 11.25 m tall with its legs under the floor (regrade 2). So: the
@@ -326,9 +363,15 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         x.apply_transform(mat)
     err = shape_error(m, chain[0])
     for i, (x, t) in enumerate(zip(chain, targets)):
-        if len(x.faces) > 1.05 * t and len(x.faces) < len(m.faces):
+        # also when it could not reduce at all (regrade 5: a 256-face cylinder asked for 40 stayed 256, no word)
+        if len(x.faces) > 1.05 * t and t < len(m.faces):
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}. "
-                            "Usually fans of very many triangles around one vertex (poles, cones).")
+                            "Usually fans of very many triangles around one vertex (poles, cones, cylinder caps), "
+                            "or a mesh already too coarse to lose more without falling apart.")
+    if err.get("worst_part_percent", 0) > PART_WARN_PERCENT:
+        warnings.append(f"a separate part ({err['worst_part_faces']} faces) changed shape by up to "
+                        f"{err['worst_part_percent']:g}% of its own size, though the whole moved less. Small parts "
+                        "(eyes, bolts, crates) lose most; raise --faces or simplify them separately.")
     if texture_lost:
         warnings.append("the input has a texture / UVs; the output is geometry only (the simplifier does not carry "
                         "UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original "
@@ -404,6 +447,12 @@ def main(argv=None):
               f"use one of {', '.join(sorted(OUT_EXT))}", file=sys.stderr)
         return 2
     try:
+        loaded = trimesh.load(a.input)
+        geoms = list(loaded.geometry.values()) if isinstance(loaded, trimesh.Scene) else [loaded]
+        kinds = [getattr(getattr(g, "visual", None), "kind", None) for g in geoms]
+        source_had = {"texture": "texture" in kinds or any(getattr(getattr(g, "visual", None), "uv", None) is not None
+                                                           for g in geoms),
+                      "colours": "vertex" in kinds}
         mesh = trimesh.load(a.input, force="mesh")
     except Exception as e:  # trimesh raises many kinds on a bad file
         print(f"mesh-diet: cannot read {a.input}: {e}", file=sys.stderr)
@@ -414,7 +463,7 @@ def main(argv=None):
 
     try:
         res = diet(mesh, faces=a.faces, lods=a.lods, lod_ratio=a.lod_ratio, height=a.height,
-                   size=a.size, up=a.up, pivot=a.pivot, min_component=a.min_component)
+                   size=a.size, up=a.up, pivot=a.pivot, min_component=a.min_component, source_had=source_had)
     except ValueError as e:
         print(f"mesh-diet: {e}", file=sys.stderr)
         return 2

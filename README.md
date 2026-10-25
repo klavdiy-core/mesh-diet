@@ -44,15 +44,18 @@ Example: [DamagedHelmet](https://github.com/KhronosGroup/glTF-Sample-Assets/tree
 
 ```
 $ python mesh_diet.py DamagedHelmet.glb -o helmet.glb --faces 5000 --lods 3 --height 0.3
-faces      15,452 -> 4,999   (LOD0 4,999, LOD1 2,499, LOD2 1,249)
+faces      15,452 -> 4,999   (LOD0 4,999, LOD1 2,500, LOD2 1,249)
 size       0.3145 x 0.3 x 0.3334 m   pivot bottom
-cleaned    8 loose part(s) removed, 55 left, watertight False, hole edges 707
-shape cost max 0.019612 m (3.579% of size), mean 0.000462 m
+cleaned    2 loose part(s) removed, 53 left, watertight False, hole edges 707
+shape cost max 0.011082 m (2.022% of size), mean 0.000296 m
 wrote      helmet.glb, helmet_LOD1.glb, helmet_LOD2.glb
-WARNING    shape moved by up to 3.579% of the size; check it by eye or raise --faces.
+WARNING    a separate part (116 faces) changed shape by up to 12.045% of its own size, though the whole moved less. Small parts (eyes, bolts, crates) lose most; raise --faces or simplify them separately.
+WARNING    the input has a texture / UVs; the output is geometry only (the simplifier does not carry UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original for close-ups.
+WARNING    2 small loose part(s) removed, 0.388% of the faces (--min-component); set --min-component 0 to keep every part.
+WARNING    shape moved by up to 2.022% of the size; check it by eye or raise --faces.
 ```
 
-The mean error is half a millimetre on a 30 cm helmet; the max is where thin panels lost their edge. That is what the warning is for.
+(0.5.2, re-run on the real file.) The mean error is a third of a millimetre on a 30 cm helmet; the max is where thin panels lost their edge, and one small 116-face piece lost 12% of its own shape. That is what the warnings are for.
 
 As a library:
 
@@ -85,6 +88,16 @@ print(res.report["shape_error"], res.report["warnings"])
   Neither warning appears when nothing was decimated.
 - Output formats: .glb .gltf .obj .ply .stl .off, checked before any work; a .gltf is written self-contained (buffers embedded), so LODs never share buffer files. A mesh within its budget is written from the original vertices, UV seams intact. A budget that leaves no triangles, or an
   input of only zero-area triangles, is a plain error.
+- The shape error is also measured per loose part, against that part's own size (`worst_part_percent`), and a part
+  that moved more than 10% of itself is named (0.5.2): 400 crates each crushed to a bipyramid moved 69% of a crate but
+  1.25% of the scene, and 0.5.1 said nothing. Small parts get at least 32 sample points each; past 4096 parts only
+  the whole is measured.
+- A scene file with several materials is merged into one mesh, and merging drops the materials: that is reported as
+  `texture_lost` / `colours_lost` even when nothing was decimated (0.5.2; 0.5.1 said false).
+- Loose parts are counted one way everywhere (shares no vertex with the rest); 0.5.1 removed by edge-connectivity and
+  could report «56 removed, 3 left» for a 5-part character.
+- LOD1 and lower are placed with LOD0's transform, so they do not pop sideways on a switch; a decimated LOD can sit a few
+  millimetres below the floor or beside LOD0's outline.
 - Quadric decimation stalls on fans where hundreds of triangles meet at one vertex (UV-sphere poles, cones). The report says so instead of pretending.
 - Tested on synthetic meshes built like image-to-3D output (even triangles, bumps, crumbs, holes) and on Khronos sample assets. Not yet on Hi3D's own output: it needs a 96 GB GPU. If you run it on one, an issue with the report is welcome.
 
