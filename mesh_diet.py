@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 @dataclass
@@ -62,15 +62,43 @@ def stats(m):
 
 
 def _to_surface(points, mesh, k=16):
-    """Distance from each point to the nearest triangle of mesh (k nearest triangle centres tried)."""
+    """Exact distance from each point to the surface of mesh. A first guess uses the k triangles with the nearest
+    centres; then every triangle that could still be closer (its centre within guess + its own radius) is measured.
+    The guess alone missed big triangles whose centre is far (a decimated mesh has them): it reported 7.06 for a
+    point lying 0.01 from the surface."""
     from scipy.spatial import cKDTree
-    k = min(k, len(mesh.faces))
-    _, idx = cKDTree(mesh.triangles_center).query(points, k=k)
-    idx = idx.reshape(len(points), k)
-    tri = mesh.triangles[idx.ravel()]
-    pts = np.repeat(points, k, axis=0)
-    close = trimesh.triangles.closest_point(tri, pts)
-    return np.linalg.norm(close - pts, axis=1).reshape(len(points), k).min(axis=1)
+    tris = mesh.triangles
+    centres = tris.mean(axis=1)
+    radius = np.linalg.norm(tris - centres[:, None, :], axis=2).max(axis=1)
+
+    def nearest(pts, ids):
+        """min distance from each point to the triangles ids (one row of ids per point)."""
+        p = np.repeat(pts, ids.shape[1], axis=0)
+        d = np.linalg.norm(trimesh.triangles.closest_point(tris[ids.ravel()], p) - p, axis=1)
+        return d.reshape(len(pts), ids.shape[1]).min(axis=1)
+
+    # the few biggest triangles are measured against every point; the bound below then only has to cover the rest
+    # (one big triangle used to make every point "unsure" and the check ran per point in Python: 19 min of tests)
+    n_big = min(64, len(tris) - 1)
+    big = np.argsort(radius)[len(tris) - n_big:] if n_big > 0 else np.array([], int)
+    small = np.setdiff1d(np.arange(len(tris)), big)
+    best = np.full(len(points), np.inf)
+    for s in range(0, len(points), 4096):
+        if len(big):
+            best[s:s + 4096] = nearest(points[s:s + 4096], np.tile(big, (len(points[s:s + 4096]), 1)))
+    tree, rmax = cKDTree(centres[small]), float(radius[small].max())
+    todo = np.arange(len(points))
+    while len(todo):
+        kk = min(k, len(small))
+        dist, idx = tree.query(points[todo], k=kk)
+        dist, idx = dist.reshape(len(todo), kk), idx.reshape(len(todo), kk)
+        best[todo] = np.minimum(best[todo], nearest(points[todo], small[idx]))
+        if kk == len(small):
+            break                                        # every small triangle was measured: exact
+        # a small triangle not among these kk is at least (kk-th centre distance - the biggest small radius) away
+        todo = todo[dist[:, -1] - rmax < best[todo]]
+        k *= 4
+    return best
 
 
 def shape_error(a, b, n=20000):
@@ -164,6 +192,8 @@ def decimate(m, faces, tolerance=0.03, tries=6):
 def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y",
          pivot="bottom", min_component=0.002):
     before = stats(mesh)
+    # the simplifier keeps geometry only: say so instead of dropping the texture without a word
+    texture_lost = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
     m, removed = clean(mesh, min_component)
     orient(m, up)
     chain, targets = [], []
@@ -182,6 +212,10 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         if len(x.faces) > 1.05 * t and len(x.faces) < len(m.faces):
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}. "
                             "Usually fans of very many triangles around one vertex (poles, cones).")
+    if texture_lost:
+        warnings.append("the input has a texture / UVs; the output is geometry only (the simplifier does not carry "
+                        "UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original "
+                        "for close-ups.")
     if err["max_percent_of_size"] > 2.0:
         warnings.append(f"shape moved by up to {err['max_percent_of_size']}% of the size; check it by eye "
                         "or raise --faces.")
@@ -190,6 +224,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         "removed_components": removed,
         "after": stats(chain[0]),
         "shape_error": err,
+        "texture_lost": bool(texture_lost),
         "lods": [{"lod": i, "faces": int(len(x.faces)), "vertices": int(len(x.vertices)), "target": t}
                  for i, (x, t) in enumerate(zip(chain, targets))],
         "warnings": warnings,

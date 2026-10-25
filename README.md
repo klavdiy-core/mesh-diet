@@ -65,7 +65,8 @@ print(res.report["shape_error"], res.report["warnings"])
 
 ## Limits (said plainly)
 
-- **Geometry only.** Textures and UVs do not survive decimation here; Hi3D's output has none anyway. For textured assets, bake the texture onto the decimated mesh afterwards.
+- **Geometry only.** Textures and UVs do not survive decimation here; Hi3D's output has none anyway. A textured input now says so in the report (`texture_lost: true` and a warning) instead of losing the texture silently. Bake the texture onto the decimated mesh afterwards.
+- The shape error is exact (0.2.0): 0.1.0 measured each point only against the 16 triangles with the nearest centres and missed big triangles whose centre is far, which a decimated mesh has; it once reported 7.06 for a point 0.01 from the surface. Checked against brute force on 500 points: 0 difference.
 - One mesh per file: a multi-object scene is merged into one mesh.
 - Loose parts below `--min-component` are deleted. For a hand-made model with many small bolts set `--min-component 0`.
 - Quadric decimation stalls on fans where hundreds of triangles meet at one vertex (UV-sphere poles, cones). The report says so instead of pretending.
