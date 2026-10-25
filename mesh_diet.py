@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 
 @dataclass
@@ -37,6 +37,31 @@ def components(m):
     count, label = connected_components(g, directed=False)
     order = np.argsort(label, kind="stable")
     return np.split(order, np.cumsum(np.bincount(label, minlength=count))[:-1])
+
+
+def _has_texture(visual):
+    """UVs or an image: a flat material colour is not a texture (regrade 7 told a flat-coloured prop to re-unwrap)."""
+    uv = getattr(visual, "uv", None)
+    mat = getattr(visual, "material", None)
+    img = getattr(mat, "image", None) if mat is not None else None
+    img = img if img is not None else getattr(mat, "baseColorTexture", None)
+    return (uv is not None and len(uv) > 0) or img is not None
+
+
+def _look(visual):
+    """What a part looks like, as a hashable key: two different keys in one scene = materials merging will lose."""
+    kind = getattr(visual, "kind", None)
+    if kind == "vertex":
+        return ("vertex",)
+    mat = getattr(visual, "material", None)
+    if mat is None:
+        return ("none",)
+    img = getattr(mat, "image", None)
+    img = img if img is not None else getattr(mat, "baseColorTexture", None)
+    colour = getattr(mat, "baseColorFactor", None)
+    colour = colour if colour is not None else getattr(mat, "main_color", None)
+    return (type(mat).__name__, None if colour is None else tuple(np.round(np.asarray(colour, float), 3).ravel()),
+            None if img is None else hash(img.tobytes()))
 
 
 def _welded(m):
@@ -202,7 +227,16 @@ def clean(m, min_component=0.002):
     parts = loose_parts(m)
     if len(parts) <= 1:
         return m, 0, 0.0, good
-    keep = [p for p in parts if len(p) >= min_component * len(m.faces)]
+    # few faces is not enough to be a crumb: it must be small too. A 12-face pedestal half the model's height and a
+    # 2 m staff were deleted next to a dense ball (regrade 7). Longest side of the part vs the whole model's.
+    span = float(m.extents.max()) or 1.0
+    tri = m.triangles
+
+    def big(p):
+        t = tri[p].reshape(-1, 3)
+        return float((t.max(axis=0) - t.min(axis=0)).max()) >= CRUMB_MAX_SIZE * span
+
+    keep = [p for p in parts if len(p) >= min_component * len(m.faces) or big(p)]
     kept_faces = sum(len(p) for p in keep)
     # «small loose parts» are crumbs only while they are a small share of the model: 1000 equal cubes are each 0.1 %
     # of the faces, and 999 of them were deleted with «shape cost 0 %» (regrade 3). Half was still too much: a tree's
@@ -274,7 +308,8 @@ def decimate(m, faces, tolerance=0.03, tries=6):
 
 MIN_LOD_FACES = 4
 MAX_PART_CHECK = 100_000    # loose parts measured one by one in the shape check; past this only the whole, and said
-CRUMB_MAX_SHARE = 0.05      # small loose parts are dropped as crumbs only while all of them are under 5% of the faces
+CRUMB_MAX_SIZE = 0.1        # ...and only parts whose longest side is under a tenth of the model's
+CRUMB_MAX_SHARE = 0.05     # small loose parts are dropped as crumbs only while all of them are under 5% of the faces
 PART_WARN_PERCENT = 10.0    # a part that moved more than this share of its own size is named
 OUT_EXT = {".glb", ".gltf", ".obj", ".ply", ".stl", ".off"}
 
@@ -312,7 +347,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     merging parts with different materials drops every visual before diet() could see one (regrade 5)."""
     before = stats(mesh)
     # the simplifier keeps geometry only: say so instead of dropping the texture without a word
-    has_texture = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
+    has_texture = _has_texture(mesh.visual)
     # vertex colours are what image-to-3D output carries; they went without a word (regrade 3)
     has_colours = getattr(mesh.visual, "kind", None) == "vertex"
     src = source_had or {}
@@ -379,9 +414,11 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     for i, (x, t) in enumerate(zip(chain, targets)):
         # also when it could not reduce at all (regrade 5: a 256-face cylinder asked for 40 stayed 256, no word)
         if len(x.faces) > 1.05 * t and t < len(m.faces):
-            warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}. "
-                            "Usually fans of very many triangles around one vertex (poles, cones, cylinder caps), "
-                            "or a mesh already too coarse to lose more without falling apart.")
+            why = ("a closed shape cannot go below a handful of faces (a tetrahedron has 4, the simplifier stops "
+                   "near 8)" if t < 12 else
+                   "usually fans of very many triangles around one vertex (poles, cones, cylinder caps), or a mesh "
+                   "already too coarse to lose more without falling apart")
+            warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}: {why}.")
     if err.get("worst_part_percent") is None:
         warnings.append(f"{err['parts_not_measured']} separate parts: too many to measure one by one, so damage to a "
                         "single small part is not checked; look at the result by eye.")
@@ -389,6 +426,11 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         warnings.append(f"a separate part ({err['worst_part_faces']} faces) changed shape by up to "
                         f"{err['worst_part_percent']:g}% of its own size, though the whole moved less. Small parts "
                         "(eyes, bolts, crates) lose most; raise --faces or simplify them separately.")
+    materials_merged = int(src.get("materials", 1)) > 1
+    if materials_merged:
+        warnings.append(f"the file has {src['materials']} different looks (materials / colours) on separate parts; "
+                        "merging them into one mesh keeps one. Split the parts and run each, or reassign materials "
+                        "in your DCC tool.")
     if texture_lost:
         warnings.append("the input has a texture / UVs; the output is geometry only (the simplifier does not carry "
                         "UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original "
@@ -415,6 +457,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         "shape_error": err,
         "texture_lost": bool(texture_lost),
         "colours_lost": bool(colours_lost),
+        "materials_merged": bool(materials_merged),
         "lods": [{"lod": i, "faces": int(len(x.faces)), "vertices": int(len(x.vertices)), "target": t}
                  for i, (x, t) in enumerate(zip(chain, targets))],
         "warnings": warnings,
@@ -471,10 +514,11 @@ def main(argv=None):
     try:
         loaded = trimesh.load(a.input)
         geoms = list(loaded.geometry.values()) if isinstance(loaded, trimesh.Scene) else [loaded]
-        kinds = [getattr(getattr(g, "visual", None), "kind", None) for g in geoms]
-        source_had = {"texture": "texture" in kinds or any(getattr(getattr(g, "visual", None), "uv", None) is not None
-                                                           for g in geoms),
-                      "colours": "vertex" in kinds}
+        visuals = [getattr(g, "visual", None) for g in geoms]
+        source_had = {"texture": any(_has_texture(v) for v in visuals),
+                      "colours": any(getattr(v, "kind", None) == "vertex" for v in visuals),
+                      # merging keeps one material: a red and a blue part came out one grey (regrade 7)
+                      "materials": len({_look(v) for v in visuals})}
         mesh = trimesh.load(a.input, force="mesh")
     except Exception as e:  # trimesh raises many kinds on a bad file
         print(f"mesh-diet: cannot read {a.input}: {e}", file=sys.stderr)
@@ -483,19 +527,43 @@ def main(argv=None):
         print(f"mesh-diet: no triangles in {a.input}", file=sys.stderr)
         return 2
 
+    # folders made and every target tried for writing BEFORE the work: a folder in the way or a protected path crashed
+    # with a traceback once all LODs were computed (regrade 7)
+    for p in (out, a.report):
+        if not p:
+            continue
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+            existed = os.path.exists(p)
+            with open(p, "ab"):
+                pass
+            if not existed:
+                os.remove(p)
+        except OSError as e:
+            print(f"mesh-diet: cannot write {p}: {e.strerror}", file=sys.stderr)
+            return 2
+
     try:
         res = diet(mesh, faces=a.faces, lods=a.lods, lod_ratio=a.lod_ratio, height=a.height,
                    size=a.size, up=a.up, pivot=a.pivot, min_component=a.min_component, source_had=source_had)
     except ValueError as e:
         print(f"mesh-diet: {e}", file=sys.stderr)
         return 2
-    for p in (out, a.report):                    # a missing folder used to crash after the LODs were written
-        if p and os.path.dirname(os.path.abspath(p)):
-            try:
-                os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-            except OSError as e:
-                print(f"mesh-diet: cannot make the folder for {p}: {e.strerror}", file=sys.stderr)
-                return 2
+    try:
+        _write(res, out)
+    except OSError as e:
+        print(f"mesh-diet: cannot write {e.filename or out}: {e.strerror}", file=sys.stderr)
+        return 2
+    res.report["input"] = os.path.basename(a.input)
+    text = json.dumps(res.report, indent=2)
+    if a.report:
+        with open(a.report, "w", encoding="utf-8") as f:
+            f.write(text)
+    _summary(res, a)
+    return 0
+
+
+def _write(res, out):
     for i, m in enumerate(res.lods):
         p = _lod_path(out, i)
         if p.lower().endswith(".gltf"):
@@ -523,11 +591,9 @@ def main(argv=None):
         else:
             m.export(p)
         res.report["lods"][i]["file"] = os.path.basename(p)
-    res.report["input"] = os.path.basename(a.input)
-    text = json.dumps(res.report, indent=2)
-    if a.report:
-        with open(a.report, "w", encoding="utf-8") as f:
-            f.write(text)
+
+
+def _summary(res, a):
     b, af, e = res.report["before"], res.report["after"], res.report["shape_error"]
     print(f"faces      {b['faces']:,} -> {af['faces']:,}   (" +
           ", ".join(f"LOD{x['lod']} {x['faces']:,}" for x in res.report["lods"]) + ")")
@@ -538,7 +604,6 @@ def main(argv=None):
     print(f"wrote      " + ", ".join(x["file"] for x in res.report["lods"]))
     for w in res.report["warnings"]:
         print(f"WARNING    {w}")
-    return 0
 
 
 if __name__ == "__main__":

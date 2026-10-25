@@ -82,6 +82,8 @@ print(res.report["shape_error"], res.report["warnings"])
   rest: slivers the simplifier leaves on a sharp edge are not counted.
 - LODs stop when the next one would have under 4 faces (a warning says so); 0.3.0 wrote empty LOD files.
 - Loose parts below `--min-component` are deleted, and the report says how many and what share of the faces they were.
+  A crumb must also be small: a part whose longest side is a tenth of the model's or more stays, however few faces it
+  has (0.5.4: 0.5.3 deleted a 12-face pedestal and a 2 m staff next to a dense ball).
   Only crumbs, though: if they add up to 5% of the faces or more, they are the model and none is deleted (0.5.3:
   0.5.2 allowed up to half and deleted a tree's 1000 leaf cards, 44% of it, by default; 0.4.0 deleted 999 of 1000
   equal cubes). For a hand-made model with many small bolts set `--min-component 0`.
@@ -98,7 +100,11 @@ print(res.report["shape_error"], res.report["warnings"])
   the whole is measured, and the report says so (`worst_part_percent: null` and a warning); 0.5.2 stopped at 4096
   and reported 0.0.
 - A scene file with several materials is merged into one mesh, and merging drops the materials: that is reported as
-  `texture_lost` / `colours_lost` even when nothing was decimated (0.5.2; 0.5.1 said false).
+  `texture_lost` / `colours_lost` even when nothing was decimated (0.5.2; 0.5.1 said false). Parts with different
+  flat colours or materials are reported as `materials_merged: true` with a warning (0.5.4: a red and a blue part
+  came out one grey with nothing said). A texture means UVs or an image; a flat colour is not called one.
+- Every output path is tried for writing before the work starts: a protected folder or a folder in the way is a
+  plain error, not a traceback after the LODs are computed (0.5.4).
 - Loose parts are counted one way everywhere (shares no vertex with the rest); 0.5.1 removed by edge-connectivity and
   could report «56 removed, 3 left» for a 5-part character.
 - LOD1 and lower are placed with LOD0's transform, so they do not pop sideways on a switch; a decimated LOD can sit a few
