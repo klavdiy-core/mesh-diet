@@ -75,7 +75,16 @@ print(res.report["shape_error"], res.report["warnings"])
   before 0.3.0 a stray shard above the head shrank the figure. A part is loose when it shares no vertex with the
   rest: slivers the simplifier leaves on a sharp edge are not counted.
 - LODs stop when the next one would have under 4 faces (a warning says so); 0.3.0 wrote empty LOD files.
-- Loose parts below `--min-component` are deleted. For a hand-made model with many small bolts set `--min-component 0`.
+- Loose parts below `--min-component` are deleted, and the report says how many and what share of the faces they were.
+  Only crumbs, though: if they add up to more than half the model (1000 equal cubes are each 0.1% of the faces), none
+  is deleted (0.5.0; 0.4.0 deleted 999 of them and reported 0% shape cost). For a hand-made model with many small
+  bolts set `--min-component 0`.
+- "A quarter of its size" means the longest side of its box (0.5.0), not its face count: a 12-face pole 3 m tall
+  next to a 5000-face ball is part of the model.
+- Vertex colours (what most image-to-3D tools output) are not carried either: `colours_lost: true` and a warning.
+  Neither warning appears when nothing was decimated.
+- Output formats: .glb .gltf .obj .ply .stl .off, checked before any work. A budget that leaves no triangles, or an
+  input of only zero-area triangles, is a plain error.
 - Quadric decimation stalls on fans where hundreds of triangles meet at one vertex (UV-sphere poles, cones). The report says so instead of pretending.
 - Tested on synthetic meshes built like image-to-3D output (even triangles, bumps, crumbs, holes) and on Khronos sample assets. Not yet on Hi3D's own output: it needs a 96 GB GPU. If you run it on one, an issue with the report is welcome.
 

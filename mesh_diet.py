@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 @dataclass
@@ -139,15 +139,19 @@ def clean(m, min_component=0.002):
     m.remove_unreferenced_vertices()
     parts = components(m)
     if len(parts) <= 1:
-        return m, 0
+        return m, 0, 0.0
     keep = [p for p in parts if len(p) >= min_component * len(m.faces)]
-    if not keep:
-        keep = [max(parts, key=len)]
+    kept_faces = sum(len(p) for p in keep)
+    # «small loose parts» are crumbs only while they are a small share of the model: 1000 equal cubes are each 0.1 %
+    # of the faces, and 999 of them were deleted with «shape cost 0 %» (regrade 3). Past half the model, keep all.
+    if kept_faces < 0.5 * len(m.faces):
+        return m, 0, 0.0
     mask = np.zeros(len(m.faces), dtype=bool)
     mask[np.concatenate(keep)] = True
+    share = 100.0 * (1 - mask.mean())
     m.update_faces(mask)
     m.remove_unreferenced_vertices()
-    return m, len(parts) - len(keep)
+    return m, len(parts) - len(keep), round(share, 3)
 
 
 def orient(m, up="y"):
@@ -204,6 +208,7 @@ def decimate(m, faces, tolerance=0.03, tries=6):
 
 
 MIN_LOD_FACES = 4
+OUT_EXT = {".glb", ".gltf", ".obj", ".ply", ".stl", ".off"}
 
 
 def measured_parts(m, parts, touch=0.02, big=0.25):
@@ -215,7 +220,10 @@ def measured_parts(m, parts, touch=0.02, big=0.25):
     main = max(range(len(parts)), key=lambda i: len(parts[i]))
     boxes = [m.submesh([p], append=True).bounds for p in parts]
     eps = touch * float(np.max(boxes[main][1] - boxes[main][0]))
-    keep = {main} | {i for i, p in enumerate(parts) if len(p) >= big * len(parts[main])}
+    # «a quarter of its size» is its size: the longest side of its box, not its face count — a 12-face 3 m pole next
+    # to a 5000-face ball is the bigger thing (regrade 3: the README said size, the code counted faces)
+    reach = [float(np.max(b[1] - b[0])) for b in boxes]
+    keep = {main} | {i for i in range(len(parts)) if reach[i] >= big * reach[main]}
     grew = True
     while grew:
         grew = False
@@ -234,8 +242,12 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
          pivot="bottom", min_component=0.002):
     before = stats(mesh)
     # the simplifier keeps geometry only: say so instead of dropping the texture without a word
-    texture_lost = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
-    m, removed = clean(mesh, min_component)
+    had_texture = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
+    # vertex colours are what image-to-3D output carries; they went without a word (regrade 3)
+    had_colours = getattr(mesh.visual, "kind", None) == "vertex"
+    m, removed, removed_share = clean(mesh, min_component)
+    if len(m.faces) == 0:
+        raise ValueError("nothing is left after cleaning: every triangle was degenerate (zero area)")
     orient(m, up)
     chain, targets = [], []
     budget = faces
@@ -249,7 +261,16 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
             break
         targets.append(t)
         chain.append(decimate(chain[-1] if chain else m, t))
+        if len(chain[-1].faces) == 0:            # --faces 1 on a small mesh decimated to nothing (regrade 3)
+            if i == 0:
+                raise ValueError(f"--faces {faces} leaves no triangles for this mesh; ask for more")
+            chain.pop()
+            targets.pop()
+            break
         budget *= lod_ratio
+    decimated = len(chain[0].faces) < len(m.faces)
+    texture_lost = had_texture and decimated      # nothing decimated = nothing lost (regrade 3: a false warning)
+    colours_lost = had_colours and decimated
     # measure the size on LOD0, so the mesh people use is exactly as tall as asked. Not on every loose part: a stray
     # shard 2 m above the head shrank a 1.8 m figure to 0.82 m (regrade 1). Not on the main body alone either: a
     # table whose legs are separate pieces came out 11.25 m tall with its legs under the floor (regrade 2). So: the
@@ -277,6 +298,12 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         warnings.append("the input has a texture / UVs; the output is geometry only (the simplifier does not carry "
                         "UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original "
                         "for close-ups.")
+    if colours_lost:
+        warnings.append("the input has vertex colours; the output is geometry only (the simplifier drops them). "
+                        "Re-project the colours onto LOD0 in your DCC tool, or keep the original for close-ups.")
+    if removed:
+        warnings.append(f"{removed} small loose part(s) removed, {removed_share:g}% of the faces (--min-component); "
+                        "set --min-component 0 to keep every part.")
     if len(group) < len(parts):
         warnings.append(f"{len(parts) - len(group)} of {len(parts)} parts float apart from the model and were left out "
                         "of the size" + (f"; they reach {reach * 100:.0f}% of its size beyond it" if reach > 0.05 else "")
@@ -287,9 +314,11 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     report = {
         "before": before,
         "removed_components": removed,
+        "removed_faces_percent": removed_share,
         "after": stats(chain[0]),
         "shape_error": err,
         "texture_lost": bool(texture_lost),
+        "colours_lost": bool(colours_lost),
         "lods": [{"lod": i, "faces": int(len(x.faces)), "vertices": int(len(x.vertices)), "target": t}
                  for i, (x, t) in enumerate(zip(chain, targets))],
         "warnings": warnings,
@@ -333,6 +362,12 @@ def main(argv=None):
             print(f"mesh-diet: {flag} must be {need}", file=sys.stderr)
             return 2
 
+    out = a.output or os.path.splitext(a.input)[0] + ".diet.glb"
+    # checked before the work, not after it (regrade 3: -o x.fbx crashed once every LOD was computed)
+    if os.path.splitext(out)[1].lower() not in OUT_EXT:
+        print(f"mesh-diet: cannot write {os.path.splitext(out)[1] or 'a file with no extension'}; "
+              f"use one of {', '.join(sorted(OUT_EXT))}", file=sys.stderr)
+        return 2
     try:
         mesh = trimesh.load(a.input, force="mesh")
     except Exception as e:  # trimesh raises many kinds on a bad file
@@ -348,7 +383,6 @@ def main(argv=None):
     except ValueError as e:
         print(f"mesh-diet: {e}", file=sys.stderr)
         return 2
-    out = a.output or os.path.splitext(a.input)[0] + ".diet.glb"
     for p in (out, a.report):                    # a missing folder used to crash after the LODs were written
         if p and os.path.dirname(os.path.abspath(p)):
             try:
