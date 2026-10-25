@@ -61,7 +61,8 @@ As a library:
 
 ```python
 import trimesh, mesh_diet
-res = mesh_diet.diet(trimesh.load("refined.glb", force="mesh"), faces=10000, lods=3, height=1.2)
+mesh, had = mesh_diet.load("refined.glb")        # had = textures / colours / materials the file carried
+res = mesh_diet.diet(mesh, faces=10000, lods=3, height=1.2, source_had=had)
 res.lods[0].export("prop.glb")
 print(res.report["shape_error"], res.report["warnings"])
 ```

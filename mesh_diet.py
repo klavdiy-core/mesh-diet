@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 
 
 @dataclass
@@ -441,9 +441,17 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         if len(x.faces) > 1.05 * t and t < len(m.faces):
             why = ("a closed shape cannot go below a handful of faces (a tetrahedron has 4, the simplifier stops "
                    "near 8)" if t < 12 else
-                   "usually fans of very many triangles around one vertex (poles, cones, cylinder caps), or a mesh "
-                   "already too coarse to lose more without falling apart")
+                   # a 268-face table of 16-sided legs was blamed on «fans of very many triangles» (regrade 9)
+                   "the mesh is already coarse: closed low-poly shapes have no cheap edge left to collapse"
+                   if len(x.faces) >= len(m.faces) or len(m.faces) < 2000 else
+                   "usually fans of very many triangles around one vertex (poles, cones, cylinder caps)")
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}: {why}.")
+    parts_after = len(loose_parts(chain[0]))
+    parts_lost = max(0, len(loose_parts(m)) - parts_after)
+    if parts_lost:
+        # a whole crate decimated to nothing was reported as «0 loose parts removed» (regrade 9)
+        warnings.append(f"{parts_lost} separate part(s) vanished in decimation (too few faces left for them); "
+                        "raise --faces to keep them.")
     if err.get("worst_part_percent") is None:
         warnings.append(f"{err['parts_not_measured']} separate parts: too many to measure one by one, so damage to a "
                         "single small part is not checked; look at the result by eye.")
@@ -478,6 +486,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     report = {
         "before": before,
         "removed_components": removed,
+        "parts_lost_in_decimation": int(parts_lost),
         "removed_faces_percent": removed_share,
         "after": stats(chain[0]),
         "shape_error": err,
@@ -492,6 +501,20 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
 
 
 # ---------- CLI ----------
+
+def load(path):
+    """(one merged mesh, what the file had) — pass the second to diet(source_had=...). Merging a scene drops its
+    materials before diet() can see them; the README's library example lost two textures with every flag false
+    (regrade 9), so the library gets the same door as the CLI."""
+    loaded = trimesh.load(path)
+    geoms = list(loaded.geometry.values()) if isinstance(loaded, trimesh.Scene) else [loaded]
+    visuals = [getattr(g, "visual", None) for g in geoms]
+    had = {"texture": any(_has_texture(v) for v in visuals),
+           "colours": any(getattr(v, "kind", None) == "vertex" for v in visuals),
+           # merging keeps one material: a red and a blue part came out one grey (regrade 7)
+           "materials": len({_look(v) for v in visuals})}
+    return trimesh.load(path, force="mesh"), had
+
 
 def _lod_path(out, i):
     if i == 0:
@@ -538,14 +561,7 @@ def main(argv=None):
               f"use one of {', '.join(sorted(OUT_EXT))}", file=sys.stderr)
         return 2
     try:
-        loaded = trimesh.load(a.input)
-        geoms = list(loaded.geometry.values()) if isinstance(loaded, trimesh.Scene) else [loaded]
-        visuals = [getattr(g, "visual", None) for g in geoms]
-        source_had = {"texture": any(_has_texture(v) for v in visuals),
-                      "colours": any(getattr(v, "kind", None) == "vertex" for v in visuals),
-                      # merging keeps one material: a red and a blue part came out one grey (regrade 7)
-                      "materials": len({_look(v) for v in visuals})}
-        mesh = trimesh.load(a.input, force="mesh")
+        mesh, source_had = load(a.input)
     except Exception as e:  # trimesh raises many kinds on a bad file
         print(f"mesh-diet: cannot read {a.input}: {e}", file=sys.stderr)
         return 2

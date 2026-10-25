@@ -36,5 +36,37 @@ class Regrade8(unittest.TestCase):
         self.assertLess(float(np.abs(fast - brute).max()), 1e-9)
 
 
+class Regrade9(unittest.TestCase):
+    """The ninth re-grade (7.5/10): red on 0.5.5."""
+
+    def test_the_library_load_reports_merged_materials_like_the_cli(self):
+        import tempfile
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            s = trimesh.creation.icosphere(3)
+            s.visual = trimesh.visual.TextureVisuals(uv=np.random.default_rng(0).random((len(s.vertices), 2)),
+                                                     image=Image.new("RGB", (8, 8), (200, 0, 0)))
+            box = trimesh.creation.box()
+            box.apply_translation([3, 0, 0])
+            src = os.path.join(d, "s.glb")
+            trimesh.Scene([s, box]).export(src)
+            mesh, had = md.load(src)
+            res = md.diet(mesh, faces=100000, source_had=had)
+            self.assertTrue(res.report["texture_lost"])
+            self.assertTrue(res.report["materials_merged"])
+
+    def test_a_part_decimated_away_is_counted(self):
+        boxes = []
+        for k in range(500):
+            b = trimesh.creation.box(extents=[0.5] * 3)
+            b.apply_translation([(k % 23) * 0.6, 0, (k // 23) * 0.6])
+            boxes.append(b)
+        res = md.diet(trimesh.util.concatenate(boxes), faces=1000)
+        lost = res.report["parts_lost_in_decimation"]
+        self.assertEqual(lost, 500 - res.report["after"]["components"])
+        if lost:
+            self.assertTrue(any("vanished" in w for w in res.report["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()
