@@ -68,6 +68,10 @@ print(res.report["shape_error"], res.report["warnings"])
 - **Geometry only.** Textures and UVs do not survive decimation here; Hi3D's output has none anyway. A textured input now says so in the report (`texture_lost: true` and a warning) instead of losing the texture silently. Bake the texture onto the decimated mesh afterwards.
 - The shape error is exact (0.2.0): 0.1.0 measured each point only against the 16 triangles with the nearest centres and missed big triangles whose centre is far, which a decimated mesh has; it once reported 7.06 for a point 0.01 from the surface. Checked against brute force on 500 points: 0 difference.
 - One mesh per file: a multi-object scene is merged into one mesh.
+- `--height` and `--size` are measured on the main body (0.3.0). A loose part that survives `--min-component` (it is a
+  share of faces, so a small but distant part can stay) is named in a warning with how far it reaches; before 0.3.0 it
+  silently shrank the figure. A part is loose when it shares no vertex with the rest: slivers the simplifier leaves
+  on a sharp edge are not counted.
 - Loose parts below `--min-component` are deleted. For a hand-made model with many small bolts set `--min-component 0`.
 - Quadric decimation stalls on fans where hundreds of triangles meet at one vertex (UV-sphere poles, cones). The report says so instead of pretending.
 - Tested on synthetic meshes built like image-to-3D output (even triangles, bumps, crumbs, holes) and on Khronos sample assets. Not yet on Hi3D's own output: it needs a 96 GB GPU. If you run it on one, an issue with the report is welcome.
