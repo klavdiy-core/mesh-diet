@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 
 
 @dataclass
@@ -102,57 +102,82 @@ def stats(m):
     }
 
 
-def _to_surface(points, mesh, k=16):
-    """Exact distance from each point to the surface of mesh. A first guess uses the k triangles with the nearest
-    centres; then every triangle that could still be closer (its centre within guess + its own radius) is measured.
-    The guess alone missed big triangles whose centre is far (a decimated mesh has them): it reported 7.06 for a
-    point lying 0.01 from the surface."""
+PAIRS = 1_000_000                      # point-triangle pairs per batch: memory stays ~100 MB whatever the shape
+
+
+def _split_long(tris, limit=2_000_000):
+    """Halve every long triangle across its longest edge until none is over 4x the median size. The halves tile the
+    triangle, so distances stay exact; but a 4 m sliver of a 640-sided trunk no longer has a 2 m bounding sphere that
+    holds every point (1280 of them made the check take 43 s, 0.5.3)."""
+    def size(t):
+        return np.linalg.norm(t - t.mean(axis=1)[:, None, :], axis=2).max(axis=1)
+
+    cap = 4 * float(np.median(size(tris))) or np.inf
+    while len(tris) < limit:
+        r = size(tris)
+        long_ = r > cap
+        if not long_.any():
+            break
+        t = tris[long_]
+        if len(tris) + long_.sum() > limit:
+            break
+        e = np.stack([np.linalg.norm(t[:, 1] - t[:, 2], axis=1), np.linalg.norm(t[:, 2] - t[:, 0], axis=1),
+                      np.linalg.norm(t[:, 0] - t[:, 1], axis=1)], axis=1)
+        a = e.argmax(axis=1)                              # the vertex opposite the longest edge
+        n = np.arange(len(t))
+        p, q, s = t[n, a], t[n, (a + 1) % 3], t[n, (a + 2) % 3]
+        mid = (q + s) / 2
+        tris = np.concatenate([tris[~long_], np.stack([p, q, mid], axis=1), np.stack([p, mid, s], axis=1)])
+    return tris
+
+
+def _to_surface(points, mesh):
+    """Exact distance from each point to the surface of mesh.
+
+    Triangles are split into tiers by size (radius within 2x inside a tier), each with its own tree of centres. A
+    triangle of radius r can be closer than the current best only if its centre lies within best + r, so per tier
+    only the centres within best + (that tier's largest r) are measured. One bound for all sizes failed three ways:
+    a guess from the nearest centres missed big far triangles (7.06 for a point 0.01 away, 0.1.0); a few big
+    triangles kept every point unsure (19 min); a dense head on a coarse capsule grew the neighbour search to 65536
+    per point and asked for 5 GB (regrade 8)."""
     from scipy.spatial import cKDTree
+    points = np.asarray(points, dtype=float)
     tris = mesh.triangles
+    best = np.full(len(points), np.inf)
+    if not len(tris) or not len(points):
+        return best
+    tris = _split_long(tris)
     centres = tris.mean(axis=1)
     radius = np.linalg.norm(tris - centres[:, None, :], axis=2).max(axis=1)
+    level = np.floor(np.log2(np.maximum(radius, radius.max() * 1e-9 + 1e-300))).astype(int)
 
-    PAIRS = 1_500_000                  # point-triangle pairs per batch: memory stays ~100 MB whatever the shape
+    def measure(pidx, tidx):
+        """best[p] = min(best[p], distance(p, triangle t)) for pairs, in bounded batches."""
+        for s in range(0, len(pidx), PAIRS):
+            pi, ti = pidx[s:s + PAIRS], tidx[s:s + PAIRS]
+            d = np.linalg.norm(trimesh.triangles.closest_point(tris[ti], points[pi]) - points[pi], axis=1)
+            np.minimum.at(best, pi, d)
 
-    def nearest(pts, ids):
-        """min distance from each point to the triangles ids (one row of ids per point), in bounded batches (a
-        capsule's long side triangles once asked for 78.7 million pairs at once: MemoryError, regrade 4)."""
-        out = np.empty(len(pts))
-        step = max(1, PAIRS // max(1, ids.shape[1]))
-        for s in range(0, len(pts), step):
-            pp, ii = pts[s:s + step], ids[s:s + step]
-            p = np.repeat(pp, ii.shape[1], axis=0)
-            d = np.linalg.norm(trimesh.triangles.closest_point(tris[ii.ravel()], p) - p, axis=1)
-            out[s:s + step] = d.reshape(len(pp), ii.shape[1]).min(axis=1)
-        return out
-
-    # the big triangles are measured against every point; the bound below then only has to cover the rest (one big
-    # triangle used to make every point "unsure": 19 min of tests). «Big» = the 64 largest and every triangle over
-    # 3x the median radius: a capsule has 128 long side triangles, and the 65th kept the bound from ever shrinking.
-    order = np.argsort(radius)
-    over = np.flatnonzero(radius > 3 * np.median(radius))
-    big = np.union1d(order[max(0, len(tris) - 64):], over)
-    if len(big) >= len(tris):
-        big = order[max(0, len(tris) - 64):]
-    big = big[:4096] if len(big) > 4096 else big
-    small = np.setdiff1d(np.arange(len(tris)), big)
-    best = np.full(len(points), np.inf)
-    if len(big):
-        best = nearest(points, np.broadcast_to(big, (len(points), len(big))))
-    if not len(small):
-        return best
-    tree, rmax = cKDTree(centres[small]), float(radius[small].max())
-    todo = np.arange(len(points))
-    while len(todo):
-        kk = min(k, len(small))
-        dist, idx = tree.query(points[todo], k=kk)
-        dist, idx = dist.reshape(len(todo), kk), idx.reshape(len(todo), kk)
-        best[todo] = np.minimum(best[todo], nearest(points[todo], small[idx]))
-        if kk == len(small):
-            break                                        # every small triangle was measured: exact
-        # a small triangle not among these kk is at least (kk-th centre distance - the biggest small radius) away
-        todo = todo[dist[:, -1] - rmax < best[todo]]
-        k *= 4
+    tiers = []
+    for lv in np.unique(level):
+        ids = np.flatnonzero(level == lv)
+        tiers.append((ids, cKDTree(centres[ids]), float(radius[ids].max())))
+    # a first guess from the few nearest centres of every tier: makes the balls below small
+    allp = np.arange(len(points))
+    for ids, tree, _ in tiers:
+        kk = min(4, len(ids))
+        _, idx = tree.query(points, k=kk)
+        idx = np.asarray(idx).reshape(len(points), kk)
+        measure(np.repeat(allp, kk), ids[idx.ravel()])
+    # then every triangle that could still be closer, tier by tier, points in chunks so the lists stay bounded
+    for ids, tree, rmax in tiers:
+        for s in range(0, len(points), 2048):
+            chunk = allp[s:s + 2048]
+            balls = tree.query_ball_point(points[chunk], best[chunk] + rmax)
+            lens = np.fromiter((len(b) for b in balls), dtype=np.int64, count=len(balls))
+            if not lens.sum():
+                continue
+            measure(np.repeat(chunk, lens), ids[np.concatenate([np.asarray(b, dtype=np.int64) for b in balls])])
     return best
 
 
@@ -444,7 +469,8 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     if len(group) < len(parts):
         warnings.append(f"{len(parts) - len(group)} of {len(parts)} parts float apart from the model and were left out "
                         "of the size" + (f"; they reach {reach * 100:.0f}% of its size beyond it" if reach > 0.05 else "")
-                        + ", so the output is taller or wider than asked. If they are stray bits, raise "
+                        + (", so the output is taller or wider than asked" if (height or size) else "")
+                        + ". If they are stray bits, raise "
                         "--min-component to drop them; if they belong (leaves, a canopy), scale by hand or with --size.")
     if err["max_percent_of_size"] > 2.0:
         warnings.append(f"shape moved by up to {err['max_percent_of_size']}% of the size; check it by eye "
