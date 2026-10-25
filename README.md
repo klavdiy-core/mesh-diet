@@ -103,6 +103,8 @@ print(res.report["shape_error"], res.report["warnings"])
   could report «56 removed, 3 left» for a 5-part character.
 - LOD1 and lower are placed with LOD0's transform, so they do not pop sideways on a switch; a decimated LOD can sit a few
   millimetres below the floor or beside LOD0's outline.
+- The shape check is slow on meshes with very many long thin triangles: each one is measured against every sample
+  point. A tree with a 640-sided trunk (1280 such triangles) and 1000 leaves takes 43 s for the check, 52 s in all.
 - Quadric decimation stalls on fans where hundreds of triangles meet at one vertex (UV-sphere poles, cones). The report says so instead of pretending.
 - Tested on synthetic meshes built like image-to-3D output (even triangles, bumps, crumbs, holes) and on Khronos sample assets. Not yet on Hi3D's own output: it needs a 96 GB GPU. If you run it on one, an issue with the report is welcome.
 
