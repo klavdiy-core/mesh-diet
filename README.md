@@ -45,18 +45,17 @@ Example: [DamagedHelmet](https://github.com/KhronosGroup/glTF-Sample-Assets/tree
 
 ```
 $ python mesh_diet.py DamagedHelmet.glb -o helmet.glb --faces 5000 --lods 3 --height 0.3
-faces      15,452 -> 4,999   (LOD0 4,999, LOD1 2,500, LOD2 1,249)
+faces      15,452 -> 4,999   (LOD0 4,999, LOD1 2,499, LOD2 1,250)
 size       0.3145 x 0.3 x 0.3334 m   pivot bottom
-cleaned    2 loose part(s) removed, 53 left, watertight False, hole edges 707
-shape cost max 0.011082 m (2.022% of size), mean 0.000296 m
+cleaned    0 loose part(s) removed, 55 left, watertight False, hole edges 715
+shape cost max 0.011082 m (2.022% of size), mean 0.000299 m
 wrote      helmet.glb, helmet_LOD1.glb, helmet_LOD2.glb
-WARNING    a separate part (116 faces) changed shape by up to 12.045% of its own size, though the whole moved less. Small parts (eyes, bolts, crates) lose most; raise --faces or simplify them separately.
+WARNING    a separate part (116 faces) changed shape by up to 13.589% of its own size, though the whole moved less. Small parts (eyes, bolts, crates) lose most; raise --faces or simplify them separately.
 WARNING    the input has a texture / UVs; the output is geometry only (the simplifier does not carry UVs). Re-unwrap and bake the texture onto LOD0 in your DCC tool, or keep the original for close-ups.
-WARNING    2 small loose part(s) removed, 0.388% of the faces (--min-component); set --min-component 0 to keep every part.
 WARNING    shape moved by up to 2.022% of the size; check it by eye or raise --faces.
 ```
 
-(0.5.2, re-run on the real file.) The mean error is a third of a millimetre on a 30 cm helmet; the max is where thin panels lost their edge, and one small 116-face piece lost 12% of its own shape. That is what the warnings are for.
+(0.5.4, re-run on the real file; its loose parts are panels a tenth of the helmet or more, so none is a crumb.) The mean error is a third of a millimetre on a 30 cm helmet; the max is where thin panels lost their edge, and one small 116-face piece lost 14% of its own shape. That is what the warnings are for.
 
 As a library:
 
