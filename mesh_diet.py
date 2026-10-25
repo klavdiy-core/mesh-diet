@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.6"
+__version__ = "0.5.7"
 
 
 @dataclass
@@ -327,8 +327,25 @@ def decimate(m, faces, tolerance=0.03, tries=6):
             break
         keep *= faces / max(got, 1)   # the simplifier misses its target; correct and retry
     out = trimesh.Trimesh(best[0].astype(np.float64), best[1], process=True)
+    _drop_flaps(out)
     out.fix_normals()
     return out
+
+
+def _drop_flaps(m):
+    """Remove triangle pairs on the same three corners (by position): the simplifier folds them flat, zero thickness,
+    each edge then used 4 times. A watertight sphere came out with 201 such flaps and 200 non-manifold edges, and the
+    summary said «hole edges 0» (regrade 10). Removing both halves leaves the surface as it was around them."""
+    if not len(m.faces):
+        return
+    g = _welded(m)
+    key = np.sort(g.faces, axis=1)
+    _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    inv = np.asarray(inv).ravel()
+    bad = cnt[inv] > 1
+    if bad.any() and not bad.all():
+        m.update_faces(~bad)
+        m.remove_unreferenced_vertices()
 
 
 MIN_LOD_FACES = 4
@@ -483,12 +500,17 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     if err["max_percent_of_size"] > 2.0:
         warnings.append(f"shape moved by up to {err['max_percent_of_size']}% of the size; check it by eye "
                         "or raise --faces.")
+    after = stats(chain[0])
+    if before["watertight"] and not after["watertight"]:
+        warnings.append(f"the input was closed (watertight), LOD0 is not: {after['boundary_edges']} hole edge(s), "
+                        f"{after['non_manifold_edges']} non-manifold edge(s). Fine for rendering; for physics or 3D "
+                        "printing raise --faces or repair it.")
     report = {
         "before": before,
         "removed_components": removed,
         "parts_lost_in_decimation": int(parts_lost),
         "removed_faces_percent": removed_share,
-        "after": stats(chain[0]),
+        "after": after,
         "shape_error": err,
         "texture_lost": bool(texture_lost),
         "colours_lost": bool(colours_lost),
@@ -571,7 +593,8 @@ def main(argv=None):
 
     # folders made and every target tried for writing BEFORE the work: a folder in the way or a protected path crashed
     # with a traceback once all LODs were computed (regrade 7)
-    for p in (out, a.report):
+    # every LOD path too (regrade 10: a folder named x_LOD1.glb failed the run after LOD0 was already written)
+    for p in [_lod_path(out, i) for i in range(a.lods)] + [a.report]:
         if not p:
             continue
         try:
@@ -641,7 +664,8 @@ def _summary(res, a):
           ", ".join(f"LOD{x['lod']} {x['faces']:,}" for x in res.report["lods"]) + ")")
     print(f"size       {' x '.join(str(v) for v in af['size_m'])} m   pivot {a.pivot}")
     print(f"cleaned    {res.report['removed_components']} loose part(s) removed, "
-          f"{af['components']} left, watertight {af['watertight']}, hole edges {af['boundary_edges']}")
+          f"{af['components']} left, watertight {af['watertight']}, hole edges {af['boundary_edges']}, "
+          f"non-manifold edges {af['non_manifold_edges']}")
     print(f"shape cost max {e['max_m']} m ({e['max_percent_of_size']}% of size), mean {e['mean_m']} m")
     print(f"wrote      " + ", ".join(x["file"] for x in res.report["lods"]))
     for w in res.report["warnings"]:

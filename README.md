@@ -45,9 +45,9 @@ Example: [DamagedHelmet](https://github.com/KhronosGroup/glTF-Sample-Assets/tree
 
 ```
 $ python mesh_diet.py DamagedHelmet.glb -o helmet.glb --faces 5000 --lods 3 --height 0.3
-faces      15,452 -> 4,999   (LOD0 4,999, LOD1 2,499, LOD2 1,250)
+faces      15,452 -> 4,997   (LOD0 4,997, LOD1 2,490, LOD2 1,237)
 size       0.3145 x 0.3 x 0.3334 m   pivot bottom
-cleaned    0 loose part(s) removed, 55 left, watertight False, hole edges 715
+cleaned    0 loose part(s) removed, 55 left, watertight False, hole edges 715, non-manifold edges 0
 shape cost max 0.011082 m (2.022% of size), mean 0.000299 m
 wrote      helmet.glb, helmet_LOD1.glb, helmet_LOD2.glb
 WARNING    a separate part (116 faces) changed shape by up to 13.589% of its own size, though the whole moved less. Small parts (eyes, bolts, crates) lose most; raise --faces or simplify them separately.
@@ -55,7 +55,7 @@ WARNING    the input has a texture / UVs; the output is geometry only (the simpl
 WARNING    shape moved by up to 2.022% of the size; check it by eye or raise --faces.
 ```
 
-(0.5.4, re-run on the real file; its loose parts are panels a tenth of the helmet or more, so none is a crumb.) The mean error is a third of a millimetre on a 30 cm helmet; the max is where thin panels lost their edge, and one small 116-face piece lost 14% of its own shape. That is what the warnings are for.
+(0.5.7, re-run on the real file; its loose parts are panels a tenth of the helmet or more, so none is a crumb.) The mean error is a third of a millimetre on a 30 cm helmet; the max is where thin panels lost their edge, and one small 116-face piece lost 14% of its own shape. That is what the warnings are for.
 
 As a library:
 
@@ -103,12 +103,15 @@ print(res.report["shape_error"], res.report["warnings"])
   `texture_lost` / `colours_lost` even when nothing was decimated (0.5.2; 0.5.1 said false). Parts with different
   flat colours or materials are reported as `materials_merged: true` with a warning (0.5.4: a red and a blue part
   came out one grey with nothing said). A texture means UVs or an image; a flat colour is not called one.
-- Every output path is tried for writing before the work starts: a protected folder or a folder in the way is a
-  plain error, not a traceback after the LODs are computed (0.5.4).
+- Every output path, each LOD's included (0.5.7), is tried for writing before the work starts: a protected folder or
+  a folder in the way is a plain error, not a traceback or half the files after the LODs are computed (0.5.4).
+- Folded flaps are dropped after decimation (0.5.7): the simplifier can leave pairs of triangles on the same three
+  corners, zero thickness; a closed 1.3M-face sphere came out with 200 non-manifold edges. It now stays closed, and
+  if a closed input still comes out open a warning says so. The summary line shows non-manifold edges too.
 - Loose parts are counted one way everywhere (shares no vertex with the rest); 0.5.1 removed by edge-connectivity and
   could report «56 removed, 3 left» for a 5-part character.
-- LOD1 and lower are placed with LOD0's transform, so they do not pop sideways on a switch; a decimated LOD can sit a few
-  millimetres below the floor or beside LOD0's outline.
+- LOD1 and lower are placed with LOD0's transform, so they do not pop sideways on a switch; a decimated LOD can sit off
+  the floor by about 1.5% of the height (27 mm on a 1.8 m blob's LOD2) or stray beside LOD0's outline.
 - The shape check is exact and its memory is bounded (0.5.5): triangles are grouped by size, each group searched with
   its own bound, long slivers halved. 0.5.4 asked for 5 GB and crashed on a dense sculpted head on a coarse capsule
   body; that case now takes about 8 s. Still slow on a dense ring of long slivers: a 640-sided 4 m trunk with 1000
