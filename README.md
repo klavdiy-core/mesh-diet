@@ -2,6 +2,11 @@
 
 Make a raw image-to-3D mesh fit for a game.
 
+![before: 84,320 faces, 30 crumbs, 10 m tall, floating off-centre; after: 2,000 faces, 1.8 m tall, feet on the floor](examples/demo.gif)
+
+<sub>A generated test blob, not a real scan; `python examples/make_demo_gif.py` remakes it. Shape cost of the cut:
+0.23% of the size at most.</sub>
+
 > RU: меши из image→3D (Hi3D, TRELLIS, Hunyuan3D…) тяжёлые и сырые: миллион треугольников, крошки вокруг, центр где попало, размера нет. mesh-diet чистит, ставит на ноги, задаёт размер в метрах, режет до бюджета треугольников, делает LOD и честно говорит, сколько формы это стоило.
 
 ## What hurts
