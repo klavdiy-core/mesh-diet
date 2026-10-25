@@ -12,7 +12,8 @@ Image-to-3D got good. Hi3D v1.0 refines geometry up to a 1536³ grid and, by its
 
 1. **Cleans**: welds vertices by position (UV seams are not holes), drops degenerate and duplicate faces, removes loose crumbs below a share of the faces (default 0.2%).
 2. **Turns it upright**: `--up z` turns a Z-up mesh into glTF's Y-up.
-3. **Decimates to a budget** with quadric edge collapse ([fast-simplification](https://github.com/pyvista/fast-simplification)), within ~3% of the target, never adding triangles.
+3. **Decimates to a budget** with quadric edge collapse ([fast-simplification](https://github.com/pyvista/fast-simplification)), within ~3% of the target on one body, never adding triangles. A scene of many small parts can land far under it
+   (the simplifier collapses whole parts): a warning says how far and how many parts vanished.
 4. **Builds LODs**: each one a share of the previous (`--lods 3 --lod-ratio 0.5` → 20k, 10k, 5k).
 5. **Sizes and places it**: `--height 1.8` (metres, measured on LOD0 over the whole model, so the asset is exactly as tall as asked) or `--size`; pivot at the bottom centre, at the centre, or left alone.
 6. **Reports what it cost**: faces and vertices before and after, size, watertight or not, hole edges, non-manifold edges, parts removed, and the **shape error**: sampled point-to-surface distance between the cleaned original and LOD0, max and mean, in metres and as % of the size. It warns when the shape moved more than 2%, or when the simplifier could not reach the budget.
@@ -87,6 +88,9 @@ print(res.report["shape_error"], res.report["warnings"])
   Only crumbs, though: if they add up to 5% of the faces or more, they are the model and none is deleted (0.5.3:
   0.5.2 allowed up to half and deleted a tree's 1000 leaf cards, 44% of it, by default; 0.4.0 deleted 999 of 1000
   equal cubes). For a hand-made model with many small bolts set `--min-component 0`.
+  These two safety rules (small in size, under 5% in all) apply only to the default. When you set `--min-component`
+  yourself, it alone decides (0.5.8): `--min-component 0.01` removes a floater cloud however much of the model it is;
+  0.5.7 ignored the flag there although its own warning advised raising it.
 - "A quarter of its size" means the longest side of its box (0.5.0), not its face count: a 12-face pole 3 m tall
   next to a 5000-face ball is part of the model.
 - Vertex colours (what most image-to-3D tools output) are not carried either: `colours_lost: true` and a warning.

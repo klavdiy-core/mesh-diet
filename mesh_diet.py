@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.7"
+__version__ = "0.5.8"
 
 
 @dataclass
@@ -234,7 +234,7 @@ def shape_error(a, b, n=20000):
 
 # ---------- steps ----------
 
-def clean(m, min_component=0.002):
+def clean(m, min_component=0.002, strict=False):
     """(welded clean mesh, parts removed, % of faces removed, mask of the ORIGINAL faces kept). Welding keeps the
     face order, so the mask carries over: a mesh that needs no decimation is written from the original vertices,
     UV seams intact (regrade 4: a crate's 24 UV vertices became 8 with «texture_lost: false»)."""
@@ -261,12 +261,14 @@ def clean(m, min_component=0.002):
         t = tri[p].reshape(-1, 3)
         return float((t.max(axis=0) - t.min(axis=0)).max()) >= CRUMB_MAX_SIZE * span
 
-    keep = [p for p in parts if len(p) >= min_component * len(m.faces) or big(p)]
+    # strict = the user set --min-component: then it alone decides. The safety rules below once overrode it, and the
+    # tool's own advice «raise --min-component» could not remove a floater cloud at any value (regrade 11)
+    keep = [p for p in parts if len(p) >= min_component * len(m.faces) or (not strict and big(p))]
     kept_faces = sum(len(p) for p in keep)
     # «small loose parts» are crumbs only while they are a small share of the model: 1000 equal cubes are each 0.1 %
     # of the faces, and 999 of them were deleted with «shape cost 0 %» (regrade 3). Half was still too much: a tree's
     # 1000 leaf cards, 44% of it, went by default (regrade 6). Past 5% of the faces, they are the model: keep all.
-    if kept_faces < (1 - CRUMB_MAX_SHARE) * len(m.faces):
+    if not strict and kept_faces < (1 - CRUMB_MAX_SHARE) * len(m.faces):
         return m, 0, 0.0, good
     mask = np.zeros(len(m.faces), dtype=bool)
     mask[np.concatenate(keep)] = True
@@ -384,9 +386,13 @@ def measured_parts(m, parts, touch=0.02, big=0.25):
 # ---------- the whole diet ----------
 
 def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y",
-         pivot="bottom", min_component=0.002, source_had=None):
+         pivot="bottom", min_component=0.002, source_had=None, strict_min_component=False):
     """source_had: {"texture": bool, "colours": bool} of the FILE, when the caller merged a scene into `mesh` —
-    merging parts with different materials drops every visual before diet() could see one (regrade 5)."""
+    merging parts with different materials drops every visual before diet() could see one (regrade 5).
+    strict_min_component: min_component alone decides what is a crumb (the CLI sets it when --min-component is given)."""
+    if not isinstance(mesh, trimesh.Trimesh):
+        # trimesh.load() of a multi-object file is a Scene: a raw AttributeError told nothing (regrade 11)
+        raise ValueError("diet() takes one mesh (trimesh.Trimesh); for a file use mesh, had = mesh_diet.load(path)")
     before = stats(mesh)
     # the simplifier keeps geometry only: say so instead of dropping the texture without a word
     has_texture = _has_texture(mesh.visual)
@@ -396,7 +402,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     had_texture = has_texture or bool(src.get("texture"))
     had_colours = has_colours or bool(src.get("colours"))
     lost_on_load = (had_texture and not has_texture) or (had_colours and not has_colours)
-    m, removed, removed_share, keep_orig = clean(mesh, min_component)
+    m, removed, removed_share, keep_orig = clean(mesh, min_component, strict_min_component)
     if len(m.faces) == 0:
         raise ValueError("nothing is left after cleaning: every triangle was degenerate (zero area)")
     orient(m, up)
@@ -421,8 +427,12 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
             chain.append(decimate(m if not chain or len(chain[-1].faces) >= len(m.faces) else chain[-1], t))
         if i and len(chain[-1].faces) >= len(chain[-2].faces) and t >= len(chain[-2].faces):
             # a budget above the mesh made identical LOD files without a word (regrade 4)
-            warnings.append(f"LOD{i} is no smaller than LOD{i - 1} ({len(chain[-1].faces)} faces): the budget is "
-                            "above what this mesh has; lower --faces to get real LODs.")
+            # «above what this mesh has» was wrong advice when LOD0 itself fell under budget (regrade 11: 24k crates,
+            # budget 5000, LOD0 2000, LOD1 told to lower --faces)
+            why = ("the budget is above what this mesh has; lower --faces to get real LODs"
+                   if len(chain[-2].faces) >= len(m.faces) else
+                   f"LOD{i - 1} already came out at {len(chain[-2].faces)} faces, under this LOD's budget {t}")
+            warnings.append(f"LOD{i} is no smaller than LOD{i - 1} ({len(chain[-1].faces)} faces): {why}.")
         if len(chain[-1].faces) == 0:            # --faces 1 on a small mesh decimated to nothing (regrade 3)
             if i == 0:
                 raise ValueError(f"--faces {faces} leaves no triangles for this mesh; ask for more")
@@ -458,13 +468,19 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         if len(x.faces) > 1.05 * t and t < len(m.faces):
             why = ("a closed shape cannot go below a handful of faces (a tetrahedron has 4, the simplifier stops "
                    "near 8)" if t < 12 else
-                   # a 268-face table of 16-sided legs was blamed on «fans of very many triangles» (regrade 9)
-                   "the mesh is already coarse: closed low-poly shapes have no cheap edge left to collapse"
-                   if len(x.faces) >= len(m.faces) or len(m.faces) < 2000 else
-                   "usually fans of very many triangles around one vertex (poles, cones, cylinder caps)")
+                   # one named cause was wrong twice (a 16-sided table, regrade 9; a flat 768-face slab, regrade 11):
+                   # say what is known — it stopped — and the usual suspects, not one diagnosis
+                   "the simplifier would not collapse further here; usual causes: coarse closed shapes, flat grids "
+                   "with open borders, fans of many triangles around one vertex")
             warnings.append(f"LOD{i}: the simplifier stopped at {len(x.faces)} faces, budget {t}: {why}.")
     parts_after = len(loose_parts(chain[0]))
     parts_lost = max(0, len(loose_parts(m)) - parts_after)
+    for i, (x, t) in enumerate(zip(chain, targets)):
+        # «within ~3% of the target» held for one body; 2000 crates collapsed to 2000 faces for a 5000 budget (regrade 11)
+        if t < len(m.faces) and len(x.faces) < 0.9 * t:
+            warnings.append(f"LOD{i} came out at {len(x.faces)} faces, {100 - 100 * len(x.faces) // t}% under the "
+                            f"budget {t}: the simplifier collapsed whole small parts instead of thinning them. "
+                            "Raise --faces, or simplify the parts separately.")
     if parts_lost:
         # a whole crate decimated to nothing was reported as «0 loose parts removed» (regrade 9)
         warnings.append(f"{parts_lost} separate part(s) vanished in decimation (too few faces left for them); "
@@ -567,6 +583,7 @@ def main(argv=None):
         if argv[i] == "--up" and argv[i + 1] in ("-y", "-z"):
             argv[i:i + 2] = [f"--up={argv[i + 1]}", ""]
     a = ap.parse_args([x for x in argv if x != ""])
+    a.min_component_given = any(x == "--min-component" or x.startswith("--min-component=") for x in argv)
     for flag, ok, need in (("--faces", a.faces >= 1, "at least 1"), ("--lods", a.lods >= 1, "at least 1"),
                            ("--lod-ratio", 0 < a.lod_ratio < 1, "between 0 and 1"),
                            ("--height", a.height is None or a.height > 0, "above 0"),
@@ -594,27 +611,42 @@ def main(argv=None):
     # folders made and every target tried for writing BEFORE the work: a folder in the way or a protected path crashed
     # with a traceback once all LODs were computed (regrade 7)
     # every LOD path too (regrade 10: a folder named x_LOD1.glb failed the run after LOD0 was already written)
+    # Folders are not made yet: a run that then failed left empty folders behind (regrade 11). The nearest existing
+    # folder is tried instead; a folder where the file must go is named as a folder, not «Permission denied».
+    import tempfile
     for p in [_lod_path(out, i) for i in range(a.lods)] + [a.report]:
         if not p:
             continue
+        if os.path.isdir(p):
+            print(f"mesh-diet: cannot write {p}: it is a folder", file=sys.stderr)
+            return 2
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-            existed = os.path.exists(p)
-            with open(p, "ab"):
-                pass
-            if not existed:
-                os.remove(p)
+            if os.path.exists(p):
+                with open(p, "ab"):
+                    pass
+            else:
+                d = os.path.dirname(os.path.abspath(p))
+                while not os.path.isdir(d):
+                    if os.path.exists(d):
+                        raise NotADirectoryError(0, f"{d} is a file, not a folder")
+                    d = os.path.dirname(d)
+                with tempfile.TemporaryFile(dir=d):
+                    pass
         except OSError as e:
             print(f"mesh-diet: cannot write {p}: {e.strerror}", file=sys.stderr)
             return 2
 
     try:
         res = diet(mesh, faces=a.faces, lods=a.lods, lod_ratio=a.lod_ratio, height=a.height,
-                   size=a.size, up=a.up, pivot=a.pivot, min_component=a.min_component, source_had=source_had)
+                   size=a.size, up=a.up, pivot=a.pivot, min_component=a.min_component, source_had=source_had,
+                   strict_min_component=a.min_component_given)
     except ValueError as e:
         print(f"mesh-diet: {e}", file=sys.stderr)
         return 2
     try:
+        for p in (out, a.report):                 # folders only now, after the work succeeded
+            if p:
+                os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
         _write(res, out)
     except OSError as e:
         print(f"mesh-diet: cannot write {e.filename or out}: {e.strerror}", file=sys.stderr)
