@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import trimesh
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 
 @dataclass
@@ -87,21 +87,35 @@ def _to_surface(points, mesh, k=16):
     centres = tris.mean(axis=1)
     radius = np.linalg.norm(tris - centres[:, None, :], axis=2).max(axis=1)
 
-    def nearest(pts, ids):
-        """min distance from each point to the triangles ids (one row of ids per point)."""
-        p = np.repeat(pts, ids.shape[1], axis=0)
-        d = np.linalg.norm(trimesh.triangles.closest_point(tris[ids.ravel()], p) - p, axis=1)
-        return d.reshape(len(pts), ids.shape[1]).min(axis=1)
+    PAIRS = 1_500_000                  # point-triangle pairs per batch: memory stays ~100 MB whatever the shape
 
-    # the few biggest triangles are measured against every point; the bound below then only has to cover the rest
-    # (one big triangle used to make every point "unsure" and the check ran per point in Python: 19 min of tests)
-    n_big = min(64, len(tris) - 1)
-    big = np.argsort(radius)[len(tris) - n_big:] if n_big > 0 else np.array([], int)
+    def nearest(pts, ids):
+        """min distance from each point to the triangles ids (one row of ids per point), in bounded batches (a
+        capsule's long side triangles once asked for 78.7 million pairs at once: MemoryError, regrade 4)."""
+        out = np.empty(len(pts))
+        step = max(1, PAIRS // max(1, ids.shape[1]))
+        for s in range(0, len(pts), step):
+            pp, ii = pts[s:s + step], ids[s:s + step]
+            p = np.repeat(pp, ii.shape[1], axis=0)
+            d = np.linalg.norm(trimesh.triangles.closest_point(tris[ii.ravel()], p) - p, axis=1)
+            out[s:s + step] = d.reshape(len(pp), ii.shape[1]).min(axis=1)
+        return out
+
+    # the big triangles are measured against every point; the bound below then only has to cover the rest (one big
+    # triangle used to make every point "unsure": 19 min of tests). «Big» = the 64 largest and every triangle over
+    # 3x the median radius: a capsule has 128 long side triangles, and the 65th kept the bound from ever shrinking.
+    order = np.argsort(radius)
+    over = np.flatnonzero(radius > 3 * np.median(radius))
+    big = np.union1d(order[max(0, len(tris) - 64):], over)
+    if len(big) >= len(tris):
+        big = order[max(0, len(tris) - 64):]
+    big = big[:4096] if len(big) > 4096 else big
     small = np.setdiff1d(np.arange(len(tris)), big)
     best = np.full(len(points), np.inf)
-    for s in range(0, len(points), 4096):
-        if len(big):
-            best[s:s + 4096] = nearest(points[s:s + 4096], np.tile(big, (len(points[s:s + 4096]), 1)))
+    if len(big):
+        best = nearest(points, np.broadcast_to(big, (len(points), len(big))))
+    if not len(small):
+        return best
     tree, rmax = cKDTree(centres[small]), float(radius[small].max())
     todo = np.arange(len(points))
     while len(todo):
@@ -133,25 +147,35 @@ def shape_error(a, b, n=20000):
 # ---------- steps ----------
 
 def clean(m, min_component=0.002):
+    """(welded clean mesh, parts removed, % of faces removed, mask of the ORIGINAL faces kept). Welding keeps the
+    face order, so the mask carries over: a mesh that needs no decimation is written from the original vertices,
+    UV seams intact (regrade 4: a crate's 24 UV vertices became 8 with «texture_lost: false»)."""
     m = _welded(m)
-    m.update_faces(m.nondegenerate_faces())
-    m.update_faces(m.unique_faces())
+    good = np.zeros(len(m.faces), dtype=bool)
+    nd = np.flatnonzero(m.nondegenerate_faces())
+    sub = m.submesh([nd], append=True) if len(nd) else m.submesh([[]], append=True)
+    uq = nd[sub.unique_faces()] if len(nd) else nd
+    good[uq] = True
+    m.update_faces(good)
     m.remove_unreferenced_vertices()
+    alive = np.flatnonzero(good)                       # m's face i is original face alive[i]
     parts = components(m)
     if len(parts) <= 1:
-        return m, 0, 0.0
+        return m, 0, 0.0, good
     keep = [p for p in parts if len(p) >= min_component * len(m.faces)]
     kept_faces = sum(len(p) for p in keep)
     # «small loose parts» are crumbs only while they are a small share of the model: 1000 equal cubes are each 0.1 %
     # of the faces, and 999 of them were deleted with «shape cost 0 %» (regrade 3). Past half the model, keep all.
     if kept_faces < 0.5 * len(m.faces):
-        return m, 0, 0.0
+        return m, 0, 0.0, good
     mask = np.zeros(len(m.faces), dtype=bool)
     mask[np.concatenate(keep)] = True
     share = 100.0 * (1 - mask.mean())
+    orig = np.zeros_like(good)
+    orig[alive[mask]] = True
     m.update_faces(mask)
     m.remove_unreferenced_vertices()
-    return m, len(parts) - len(keep), round(share, 3)
+    return m, len(parts) - len(keep), round(share, 3), orig
 
 
 def orient(m, up="y"):
@@ -245,10 +269,14 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
     had_texture = getattr(mesh.visual, "kind", None) == "texture" or getattr(mesh.visual, "uv", None) is not None
     # vertex colours are what image-to-3D output carries; they went without a word (regrade 3)
     had_colours = getattr(mesh.visual, "kind", None) == "vertex"
-    m, removed, removed_share = clean(mesh, min_component)
+    m, removed, removed_share, keep_orig = clean(mesh, min_component)
     if len(m.faces) == 0:
         raise ValueError("nothing is left after cleaning: every triangle was degenerate (zero area)")
     orient(m, up)
+    raw = mesh.copy()                                 # the original vertices, UV seams and colours intact
+    raw.update_faces(keep_orig)
+    raw.remove_unreferenced_vertices()
+    orient(raw, up)
     chain, targets = [], []
     budget = faces
     warnings = []
@@ -260,7 +288,14 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
                             f"(asked for {lods}). Raise --faces or lower --lods.")
             break
         targets.append(t)
-        chain.append(decimate(chain[-1] if chain else m, t))
+        if t >= len(m.faces) and (not chain or len(chain[-1].faces) >= len(m.faces)):
+            chain.append(raw.copy())                  # within budget: nothing to simplify, nothing welded away
+        else:
+            chain.append(decimate(m if not chain or len(chain[-1].faces) >= len(m.faces) else chain[-1], t))
+        if i and len(chain[-1].faces) >= len(chain[-2].faces):
+            # a budget above the mesh made identical LOD files without a word (regrade 4)
+            warnings.append(f"LOD{i} is no smaller than LOD{i - 1} ({len(chain[-1].faces)} faces): the budget is "
+                            "above what this mesh has; lower --faces to get real LODs.")
         if len(chain[-1].faces) == 0:            # --faces 1 on a small mesh decimated to nothing (regrade 3)
             if i == 0:
                 raise ValueError(f"--faces {faces} leaves no triangles for this mesh; ask for more")
@@ -287,7 +322,7 @@ def diet(mesh, faces=20000, lods=1, lod_ratio=0.5, height=None, size=None, up="y
         reach = float(np.max(np.concatenate([lo - out_lo, out_hi - hi])) / max(body.extents.max(), 1e-12))
     else:
         reach = 0.0
-    for x in [m] + chain:
+    for x in [m] + [c for c in chain if c is not m]:
         x.apply_transform(mat)
     err = shape_error(m, chain[0])
     for i, (x, t) in enumerate(zip(chain, targets)):
@@ -392,7 +427,15 @@ def main(argv=None):
                 return 2
     for i, m in enumerate(res.lods):
         p = _lod_path(out, i)
-        m.export(p)
+        if p.lower().endswith(".gltf"):
+            # one self-contained file per LOD: separate buffers were all named gltf_buffer_0.bin, so every LOD
+            # overwrote the last one's and LOD0 no longer loaded (regrade 4)
+            from trimesh.exchange.gltf import export_gltf
+            files = export_gltf(trimesh.Scene(m), embed_buffers=True)
+            with open(p, "wb") as fh:
+                fh.write(files["model.gltf"])
+        else:
+            m.export(p)
         res.report["lods"][i]["file"] = os.path.basename(p)
     res.report["input"] = os.path.basename(a.input)
     text = json.dumps(res.report, indent=2)

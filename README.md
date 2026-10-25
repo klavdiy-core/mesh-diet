@@ -83,7 +83,7 @@ print(res.report["shape_error"], res.report["warnings"])
   next to a 5000-face ball is part of the model.
 - Vertex colours (what most image-to-3D tools output) are not carried either: `colours_lost: true` and a warning.
   Neither warning appears when nothing was decimated.
-- Output formats: .glb .gltf .obj .ply .stl .off, checked before any work. A budget that leaves no triangles, or an
+- Output formats: .glb .gltf .obj .ply .stl .off, checked before any work; a .gltf is written self-contained (buffers embedded), so LODs never share buffer files. A mesh within its budget is written from the original vertices, UV seams intact. A budget that leaves no triangles, or an
   input of only zero-area triangles, is a plain error.
 - Quadric decimation stalls on fans where hundreds of triangles meet at one vertex (UV-sphere poles, cones). The report says so instead of pretending.
 - Tested on synthetic meshes built like image-to-3D output (even triangles, bumps, crumbs, holes) and on Khronos sample assets. Not yet on Hi3D's own output: it needs a 96 GB GPU. If you run it on one, an issue with the report is welcome.
